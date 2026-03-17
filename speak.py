@@ -29,7 +29,15 @@ import time
 import tty
 import warnings
 
-warnings.filterwarnings("ignore")
+warnings.filterwarnings("ignore", category=FutureWarning, module=r"torch")
+warnings.filterwarnings("ignore", category=UserWarning, module=r"torch")
+warnings.filterwarnings("ignore", category=FutureWarning, module=r"transformers")
+warnings.filterwarnings("ignore", category=UserWarning, module=r"transformers")
+warnings.filterwarnings("ignore", category=FutureWarning, module=r"kokoro")
+warnings.filterwarnings("ignore", category=UserWarning, module=r"kokoro")
+warnings.filterwarnings("ignore", category=UserWarning, module=r"sounddevice")
+warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"torch")
+warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"transformers")
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import numpy as np
@@ -516,12 +524,14 @@ def cmd_setup():
     """Install claude-voice hook into Claude Code settings."""
     save_default_config()
 
-    # Read existing settings
+    # Read existing settings, preserving file content
+    raw = ""
     settings = {}
     if os.path.exists(SETTINGS_PATH):
         try:
             with open(SETTINGS_PATH) as f:
-                settings = json.load(f)
+                raw = f.read()
+            settings = json.loads(raw)
         except (json.JSONDecodeError, OSError):
             pass
 
@@ -555,7 +565,7 @@ def cmd_setup():
 
     os.makedirs(os.path.dirname(SETTINGS_PATH), exist_ok=True)
     with open(SETTINGS_PATH, "w") as f:
-        json.dump(settings, f, indent=2)
+        f.write(json.dumps(settings, indent=2) + "\n")
 
     print(f"{GREEN}claude-voice installed.{RESET}")
     print(f"  Hook added to: {SETTINGS_PATH}")
@@ -709,11 +719,16 @@ def main():
 
     try:
         speak_and_highlight(text, voice)
-    except Exception:
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        print(f"claude-voice: {e}", file=sys.stderr)
+        sys.exit(1)
+    finally:
+        _restore_terminal()
         if _tty:
             _tty.write(SHOW_CURSOR)
             _tty.flush()
-        sys.exit(0)
 
 
 if __name__ == "__main__":
