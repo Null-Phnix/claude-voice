@@ -115,6 +115,9 @@ _active_tty: str | None = None
 _active_tty_t: float = 0.0
 _playback_lock = threading.Lock()
 _daemon_idle_t0: float = 0.0
+# Per-terminal deny-list. A muted tty never speaks even if it holds the claim.
+# In-memory only; resets when the daemon restarts.
+_muted_ttys: set[str] = set()
 
 VOICE_LIST = {
     "af_heart": "American female, warm & expressive",
@@ -699,6 +702,25 @@ def _handle_client(conn: socket.socket) -> None:
             conn.sendall(json.dumps({"ok": True}).encode() + b"\n")
             return
 
+        if op in ("mute", "unmute", "toggle"):
+            tty_path = req.get("tty_path") or ""
+            if not tty_path:
+                conn.sendall(json.dumps({"error": "no tty_path"}).encode() + b"\n")
+                return
+            if op == "mute":
+                _muted_ttys.add(tty_path)
+            elif op == "unmute":
+                _muted_ttys.discard(tty_path)
+            else:  # toggle
+                if tty_path in _muted_ttys:
+                    _muted_ttys.discard(tty_path)
+                else:
+                    _muted_ttys.add(tty_path)
+            muted = tty_path in _muted_ttys
+            _daemon_log(f"{op}: {tty_path} -> {'muted' if muted else 'unmuted'}")
+            conn.sendall(json.dumps({"ok": True, "muted": muted}).encode() + b"\n")
+            return
+
         if op == "status":
             stale = _active_tty and (time.monotonic() - _active_tty_t > ACTIVE_TTY_STALE)
             conn.sendall(json.dumps({
@@ -707,6 +729,7 @@ def _handle_client(conn: socket.socket) -> None:
                 "active_tty": None if stale else _active_tty,
                 "active_tty_age_s": (time.monotonic() - _active_tty_t) if _active_tty else None,
                 "idle_s": time.monotonic() - _daemon_idle_t0,
+                "muted_ttys": sorted(_muted_ttys),
             }).encode() + b"\n")
             return
 
@@ -718,6 +741,12 @@ def _handle_client(conn: socket.socket) -> None:
 
         if not text.strip():
             conn.sendall(json.dumps({"error": "empty"}).encode() + b"\n")
+            return
+
+        # Per-terminal mute: a tty explicitly toggled off never speaks.
+        if tty_path in _muted_ttys:
+            _daemon_log(f"skip: tty {tty_path} is muted")
+            conn.sendall(json.dumps({"skipped": "muted"}).encode() + b"\n")
             return
 
         # Multi-terminal gating: if a fresh claim exists and points elsewhere,
@@ -968,6 +997,27 @@ def cmd_unclaim() -> None:
     _send_to_daemon({"op": "unclaim"}, timeout=1.0)
 
 
+def _cmd_mute_op(op: str) -> None:
+    """Shared body for `mute`, `unmute`, `toggle` CLI commands."""
+    tty_path = _resolve_tty()
+    if not _ensure_daemon():
+        print(f"  {RED}daemon could not be reached{RESET}")
+        return
+    resp = _send_to_daemon({"op": op, "tty_path": tty_path}, timeout=1.5) or {}
+    muted = resp.get("muted")
+    if muted is True:
+        print(f"  {RED}voice OFF{RESET} for this terminal  ({DIM}{tty_path}{RESET})")
+    elif muted is False:
+        print(f"  {GREEN}voice ON{RESET} for this terminal  ({DIM}{tty_path}{RESET})")
+    else:
+        print(f"  {RED}error{RESET}: {resp}")
+
+
+def cmd_mute() -> None: _cmd_mute_op("mute")
+def cmd_unmute() -> None: _cmd_mute_op("unmute")
+def cmd_toggle_voice() -> None: _cmd_mute_op("toggle")
+
+
 def cmd_daemon_status() -> None:
     if not _daemon_alive():
         print(f"  {RED}daemon not running{RESET}")
@@ -978,6 +1028,9 @@ def cmd_daemon_status() -> None:
     idle = resp.get("idle_s")
     idle_str = f"{idle:.0f}s" if isinstance(idle, (int, float)) else "?"
     print(f"  {GREEN}daemon running{RESET}  pid={pid}  idle={idle_str}  active_tty={active}")
+    muted = resp.get("muted_ttys") or []
+    if muted:
+        print(f"  {RED}muted{RESET}: {', '.join(muted)}")
 
 
 def cmd_daemon_stop() -> None:
@@ -991,7 +1044,8 @@ def cmd_daemon_stop() -> None:
 def main():
     SUBCOMMANDS = {
         "setup", "demo", "benchmark", "on", "off",
-        "claim", "unclaim", "daemon-status", "daemon-stop",
+        "claim", "unclaim", "mute", "unmute", "toggle",
+        "daemon-status", "daemon-stop",
     }
     if len(sys.argv) >= 2 and sys.argv[1] in SUBCOMMANDS:
         cmd = sys.argv[1]
@@ -1002,6 +1056,9 @@ def main():
         elif cmd == "off":          cmd_toggle(False)
         elif cmd == "claim":        cmd_claim()
         elif cmd == "unclaim":      cmd_unclaim()
+        elif cmd == "mute":         cmd_mute()
+        elif cmd == "unmute":       cmd_unmute()
+        elif cmd == "toggle":       cmd_toggle_voice()
         elif cmd == "daemon-status": cmd_daemon_status()
         elif cmd == "daemon-stop":  cmd_daemon_stop()
         sys.exit(0)
