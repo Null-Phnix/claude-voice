@@ -22,6 +22,8 @@ import os
 import re
 import select
 import signal
+import socket
+import subprocess
 import sys
 import termios
 import threading
@@ -46,6 +48,14 @@ CHIME_ENABLED = True
 CONFIG_PATH = os.path.expanduser("~/.config/claude-voice/config.json")
 SETTINGS_PATH = os.path.expanduser("~/.claude/settings.json")
 SCRIPT_PATH = os.path.abspath(__file__)
+
+# ── daemon / runtime state ──
+RUNTIME_DIR = os.path.expanduser("~/.cache/claude-voice")
+SOCK_PATH = os.path.join(RUNTIME_DIR, "daemon.sock")
+PID_PATH = os.path.join(RUNTIME_DIR, "daemon.pid")
+LOG_PATH = os.path.join(RUNTIME_DIR, "daemon.log")
+DAEMON_IDLE_TIMEOUT = 1800            # seconds before idle daemon exits
+DAEMON_SPAWN_WAIT = 15                # max seconds to wait for cold-spawned daemon
 
 # ── dev pronunciation fixes ──
 PRONOUNCE = {
@@ -98,6 +108,10 @@ _interrupted = False
 _config = None
 _tty_fd = None
 _old_term = None
+
+# Daemon-only: serialize playback and track idle time for the idle-timeout exit.
+_playback_lock = threading.Lock()
+_daemon_idle_t0: float = 0.0
 
 VOICE_LIST = {
     "af_heart": "American female, warm & expressive",
@@ -155,14 +169,19 @@ signal.signal(signal.SIGINT, _handle_signal)
 signal.signal(signal.SIGTERM, _handle_signal)
 
 
-def _start_keypress_listener():
-    """Start a background thread that sets _interrupted on any keypress."""
+def _start_keypress_listener(tty_path: str = "/dev/tty"):
+    """Start a background thread that sets _interrupted on any keypress.
+
+    `tty_path` lets the daemon listen on the client's terminal rather than
+    its own (the daemon has no controlling tty when detached).
+    """
     global _tty_fd, _old_term
 
     def _listen():
         global _interrupted, _tty_fd, _old_term
+        fd = None
         try:
-            fd = os.open("/dev/tty", os.O_RDONLY)
+            fd = os.open(tty_path, os.O_RDONLY)
             _tty_fd = fd
             _old_term = termios.tcgetattr(fd)
             tty.setraw(fd)
@@ -178,10 +197,11 @@ def _start_keypress_listener():
             pass
         finally:
             _restore_terminal()
-            try:
-                os.close(fd)
-            except (OSError, UnboundLocalError):
-                pass
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
 
     t = threading.Thread(target=_listen, daemon=True)
     t.start()
@@ -243,10 +263,16 @@ def get_pipe():
     return _pipe
 
 
-def get_tty():
+def get_tty(tty_path: str = "/dev/tty"):
+    """Open a writable tty for karaoke rendering.
+
+    `tty_path` defaults to the controlling terminal of the current process.
+    The daemon passes the client's tty path here so output lands in the
+    user's terminal, not the daemon's (detached) one.
+    """
     global _tty
     try:
-        _tty = open("/dev/tty", "w")
+        _tty = open(tty_path, "w")
     except OSError:
         _tty = sys.stderr
     return _tty
@@ -384,7 +410,8 @@ def generate_audio(text: str, voice: str) -> tuple[list, float]:
     return sentence_audio, gen_time
 
 
-def speak_and_highlight(text: str, voice: str, show_stats: bool = False) -> dict:
+def speak_and_highlight(text: str, voice: str, show_stats: bool = False,
+                        tty_path: str = "/dev/tty") -> dict:
     cfg = load_config()
     window = cfg.get("window", WINDOW)
     done_pause = cfg.get("done_pause", DONE_PAUSE)
@@ -434,13 +461,13 @@ def speak_and_highlight(text: str, voice: str, show_stats: bool = False) -> dict
         for wstart, wend in word_timings:
             global_timings.append((seg_start + wstart, seg_start + wend))
 
-    tty = get_tty()
+    tty = get_tty(tty_path)
 
     if chime:
         play_chime_start()
 
     # Start keypress listener — any key interrupts playback
-    listener = _start_keypress_listener()
+    listener = _start_keypress_listener(tty_path)
 
     tty.write(HIDE_CURSOR)
     header = f"  {LABEL}now speaking{RESET}  {LABEL}|{RESET}  {LABEL}{voice}{RESET}  {DIM}(press any key to skip){RESET}"
@@ -508,6 +535,254 @@ def speak_and_highlight(text: str, voice: str, show_stats: bool = False) -> dict
         tty.close()
 
     return stats
+
+
+# ── daemon ──
+#
+# Why a daemon exists: loading Kokoro takes ~6–10s, and the Claude Code Stop
+# hook fires a fresh Python process for every assistant response. Without a
+# daemon, every response repays that cold-start. The daemon loads the model
+# once and accepts requests over a Unix socket. Cold TTFA stays ~6–10s on the
+# very first response, but warm TTFA drops to ~0.6s.
+
+
+def _daemon_log(msg: str) -> None:
+    try:
+        os.makedirs(RUNTIME_DIR, exist_ok=True)
+        with open(LOG_PATH, "a") as f:
+            f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+    except OSError:
+        pass
+
+
+def _resolve_tty() -> str:
+    """Best-effort: a stable path to the user's controlling terminal.
+
+    Hooks are launched with stdin/stdout/stderr as pipes, so `ttyname(fd)`
+    on those fds raises. We fall back to opening /dev/tty (which always
+    refers to the *calling* process's controlling terminal) and ttyname
+    that fd — that gives a stable identifier like `/dev/ttys001`.
+    """
+    for fd in (2, 1, 0):
+        try:
+            return os.ttyname(fd)
+        except OSError:
+            continue
+    fd = None
+    try:
+        fd = os.open("/dev/tty", os.O_RDONLY)
+        return os.ttyname(fd)
+    except OSError:
+        return "/dev/tty"
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def _daemon_alive() -> bool:
+    """Return True if a daemon is reachable on the socket."""
+    if not os.path.exists(SOCK_PATH):
+        return False
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(0.5)
+        s.connect(SOCK_PATH)
+        s.sendall(json.dumps({"op": "ping"}).encode() + b"\n")
+        resp = s.recv(256)
+        s.close()
+        return b'"ok"' in resp
+    except (OSError, socket.timeout):
+        return False
+
+
+def _spawn_daemon() -> None:
+    """Spawn the daemon process detached. Returns immediately."""
+    os.makedirs(RUNTIME_DIR, exist_ok=True)
+    log = open(LOG_PATH, "a")
+    subprocess.Popen(
+        [sys.executable, SCRIPT_PATH, "--daemon"],
+        stdin=subprocess.DEVNULL,
+        stdout=log,
+        stderr=log,
+        start_new_session=True,
+        close_fds=True,
+    )
+
+
+def _send_to_daemon(payload: dict, timeout: float = 2.0) -> dict | None:
+    """Send a request to the daemon. Returns the parsed response or None."""
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect(SOCK_PATH)
+        s.sendall(json.dumps(payload).encode() + b"\n")
+        buf = b""
+        while b"\n" not in buf and len(buf) < 8192:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+        s.close()
+        line = buf.split(b"\n", 1)[0]
+        return json.loads(line.decode("utf-8", errors="replace"))
+    except (OSError, socket.timeout, json.JSONDecodeError):
+        return None
+
+
+def _ensure_daemon(wait_seconds: int = DAEMON_SPAWN_WAIT) -> bool:
+    """Spawn the daemon if not running and wait up to `wait_seconds` for ready.
+
+    Returns True if a live daemon is reachable when the function returns.
+    """
+    if _daemon_alive():
+        return True
+    _spawn_daemon()
+    for _ in range(wait_seconds * 5):
+        time.sleep(0.2)
+        if _daemon_alive():
+            return True
+    return False
+
+
+def _handle_client(conn: socket.socket) -> None:
+    """One connection's lifecycle. Runs on a daemon worker thread."""
+    global _daemon_idle_t0, _interrupted
+    try:
+        conn.settimeout(2.0)
+        buf = b""
+        while b"\n" not in buf and len(buf) < 2_000_000:
+            chunk = conn.recv(8192)
+            if not chunk:
+                break
+            buf += chunk
+        line = buf.split(b"\n", 1)[0]
+        if not line:
+            return
+        req = json.loads(line.decode("utf-8", errors="replace"))
+        _daemon_idle_t0 = time.monotonic()
+
+        op = req.get("op", "speak")
+
+        if op == "ping":
+            conn.sendall(json.dumps({"ok": True}).encode() + b"\n")
+            return
+
+        if op == "shutdown":
+            conn.sendall(json.dumps({"ok": True}).encode() + b"\n")
+            _daemon_log("shutdown requested")
+            os.kill(os.getpid(), signal.SIGTERM)
+            return
+
+        if op == "status":
+            conn.sendall(json.dumps({
+                "ok": True,
+                "pid": os.getpid(),
+                "idle_s": time.monotonic() - _daemon_idle_t0,
+            }).encode() + b"\n")
+            return
+
+        # op == "speak"
+        text = req.get("text", "")
+        voice = req.get("voice") or load_config().get("voice", DEFAULT_VOICE)
+        tty_path = req.get("tty_path") or "/dev/tty"
+
+        if not text.strip():
+            conn.sendall(json.dumps({"error": "empty"}).encode() + b"\n")
+            return
+
+        # Ack the request immediately, then play synchronously under a lock so
+        # a second speak request preempts (not overlaps) the first.
+        conn.sendall(json.dumps({"queued": True}).encode() + b"\n")
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+        # Preempt any in-progress playback
+        _interrupted = True
+        sd.stop()
+
+        with _playback_lock:
+            _interrupted = False
+            try:
+                speak_and_highlight(text, voice, show_stats=False, tty_path=tty_path)
+            except Exception as e:
+                _daemon_log(f"playback error: {e}")
+    except (json.JSONDecodeError, OSError, ValueError) as e:
+        try:
+            conn.sendall(json.dumps({"error": str(e)}).encode() + b"\n")
+        except OSError:
+            pass
+    finally:
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+
+def cmd_daemon() -> None:
+    """Run as TTS daemon. Loads Kokoro once, serves the Unix socket."""
+    global _daemon_idle_t0
+
+    os.makedirs(RUNTIME_DIR, exist_ok=True)
+    if _daemon_alive():
+        _daemon_log("daemon already running, exiting")
+        return
+
+    # Stale socket cleanup — a prior daemon that crashed without unlinking.
+    try:
+        os.unlink(SOCK_PATH)
+    except FileNotFoundError:
+        pass
+
+    try:
+        with open(PID_PATH, "w") as f:
+            f.write(str(os.getpid()))
+    except OSError:
+        pass
+
+    _daemon_log("loading kokoro model...")
+    t0 = time.monotonic()
+    get_pipe()
+    _daemon_log(f"kokoro loaded in {time.monotonic()-t0:.2f}s")
+
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(SOCK_PATH)
+    os.chmod(SOCK_PATH, 0o600)
+    srv.listen(8)
+    srv.settimeout(5.0)
+    _daemon_log(f"listening on {SOCK_PATH}")
+
+    _daemon_idle_t0 = time.monotonic()
+
+    def _cleanup(*_args):
+        for path in (SOCK_PATH, PID_PATH):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _cleanup)
+    signal.signal(signal.SIGINT, _cleanup)
+
+    while True:
+        if time.monotonic() - _daemon_idle_t0 > DAEMON_IDLE_TIMEOUT:
+            _daemon_log("idle timeout, exiting")
+            _cleanup()
+
+        try:
+            conn, _ = srv.accept()
+        except socket.timeout:
+            continue
+        except OSError as e:
+            _daemon_log(f"accept error: {e}")
+            continue
+
+        threading.Thread(target=_handle_client, args=(conn,), daemon=True).start()
 
 
 # ── commands ──
@@ -633,31 +908,56 @@ def cmd_toggle(enable: bool):
     print(f"  claude-voice is now {state}")
 
 
+def cmd_daemon_status() -> None:
+    if not _daemon_alive():
+        print(f"  {RED}daemon not running{RESET}")
+        return
+    resp = _send_to_daemon({"op": "status"}, timeout=1.0) or {}
+    pid = resp.get("pid", "?")
+    idle = resp.get("idle_s")
+    idle_str = f"{idle:.0f}s" if isinstance(idle, (int, float)) else "?"
+    print(f"  {GREEN}daemon running{RESET}  pid={pid}  idle={idle_str}")
+
+
+def cmd_daemon_stop() -> None:
+    if not _daemon_alive():
+        print(f"  {DIM}daemon not running{RESET}")
+        return
+    _send_to_daemon({"op": "shutdown"}, timeout=1.0)
+    print(f"  daemon stopped")
+
+
 def main():
-    # Handle subcommands first
-    if len(sys.argv) >= 2 and sys.argv[1] in ("setup", "demo", "benchmark", "on", "off"):
+    SUBCOMMANDS = {
+        "setup", "demo", "benchmark", "on", "off",
+        "daemon-status", "daemon-stop",
+    }
+    if len(sys.argv) >= 2 and sys.argv[1] in SUBCOMMANDS:
         cmd = sys.argv[1]
-        if cmd == "setup":
-            cmd_setup()
-        elif cmd == "demo":
-            cmd_demo()
-        elif cmd == "benchmark":
-            cmd_benchmark()
-        elif cmd == "on":
-            cmd_toggle(True)
-        elif cmd == "off":
-            cmd_toggle(False)
+        if cmd == "setup":           cmd_setup()
+        elif cmd == "demo":          cmd_demo()
+        elif cmd == "benchmark":     cmd_benchmark()
+        elif cmd == "on":            cmd_toggle(True)
+        elif cmd == "off":           cmd_toggle(False)
+        elif cmd == "daemon-status": cmd_daemon_status()
+        elif cmd == "daemon-stop":   cmd_daemon_stop()
         sys.exit(0)
 
     parser = argparse.ArgumentParser(
         description="Claude Code TTS with word highlighting",
-        usage="claude-voice [setup|demo|benchmark|on|off] or claude-voice [options] [text]",
+        usage="claude-voice [setup|demo|benchmark|on|off|daemon-status|daemon-stop] or claude-voice [options] [text]",
     )
     parser.add_argument("text", nargs="*", help="Text to speak")
     parser.add_argument("--voice", "-v", default=None, help="Kokoro voice ID")
     parser.add_argument("--voices", action="store_true", help="List available voices")
     parser.add_argument("--long", action="store_true", help="No truncation — speak full text")
+    parser.add_argument("--daemon", action="store_true", help="Run as TTS daemon (internal)")
+    parser.add_argument("--no-daemon", action="store_true", help="Force in-process speak; never spawn or use the daemon")
     args = parser.parse_args()
+
+    if args.daemon:
+        cmd_daemon()
+        sys.exit(0)
 
     if args.voices:
         cfg = load_config()
@@ -707,8 +1007,26 @@ def main():
     if not args.long and len(text) > max_chars:
         text = text[:max_chars].rsplit(" ", 1)[0] + "..."
 
+    tty_path = _resolve_tty()
+    use_daemon = cfg.get("use_daemon", True) and not args.no_daemon
+
+    if use_daemon:
+        # If a daemon is alive, send and return — fastest path (~50ms client time).
+        # If not, spawn one and wait up to DAEMON_SPAWN_WAIT for it to warm.
+        # Falls through to in-process only if the daemon never becomes reachable.
+        if _ensure_daemon():
+            resp = _send_to_daemon({
+                "op": "speak",
+                "text": text,
+                "voice": voice,
+                "tty_path": tty_path,
+            }, timeout=5.0)
+            if resp is not None and "queued" in resp:
+                sys.exit(0)
+            # Daemon reachable but request errored — fall through to in-process
+
     try:
-        speak_and_highlight(text, voice)
+        speak_and_highlight(text, voice, tty_path=tty_path)
     except Exception:
         if _tty:
             _tty.write(SHOW_CURSOR)
