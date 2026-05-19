@@ -19,6 +19,7 @@ You talk to Claude with `/voice`. Now Claude talks back — with real-time word-
 - [Voices](#voices)
 - [Config](#config)
 - [How It Works](#how-it-works)
+- [Daemon mode](#daemon-mode)
 - [Benchmark](#benchmark)
 - [Why Not VoiceMode / ElevenLabs / OpenAI TTS?](#why-not-voicemode--elevenlabs--openai-tts)
 - [Requirements](#requirements)
@@ -48,6 +49,7 @@ One file. 21KB of Python. Zero API keys. It just works.
 - **Smart filtering** — skips code-heavy responses, strips markdown/URLs/tables, fixes dev pronunciations (CLI, API, JSON, nginx, kubectl)
 - **Interrupt on keypress** — press any key to stop immediately
 - **One-command setup** — `claude-voice setup` adds the hook automatically
+- **Background daemon (new)** — Kokoro loads once and stays in memory. Warm TTFA drops from ~6s to ~0.6s
 
 ---
 
@@ -103,7 +105,7 @@ That's it. Restart Claude Code and every response will be spoken.
 ## Commands
 
 ```bash
-claude-voice setup              # install hook into Claude Code
+claude-voice setup              # install Stop hook into Claude Code
 claude-voice demo               # run a polished demo (for screen recording)
 claude-voice benchmark          # measure latency, print shareable stats
 claude-voice on                 # enable
@@ -111,6 +113,11 @@ claude-voice off                # disable (without removing the hook)
 claude-voice --voices           # list all 12 voices
 claude-voice --voice am_fenrir "text"   # speak with a specific voice
 claude-voice --long "text"      # no truncation for long text
+claude-voice --no-daemon "text" # bypass the daemon; speak in-process
+
+# Daemon control
+claude-voice daemon-status      # show daemon pid + idle time
+claude-voice daemon-stop        # cleanly shut the daemon down
 ```
 
 ---
@@ -144,9 +151,12 @@ Config lives at `~/.config/claude-voice/config.json`:
   "min_chars": 30,
   "max_chars": 1500,
   "chime": true,
-  "enabled": true
+  "enabled": true,
+  "use_daemon": true
 }
 ```
+
+Set `"use_daemon": false` to go back to one-shot, in-process behavior (every response reloads the model). The default is `true`.
 
 ---
 
@@ -157,10 +167,32 @@ Config lives at `~/.config/claude-voice/config.json`:
 3. Strips markdown, code blocks, URLs, tables — keeps only speakable text
 4. Skips if response is mostly code (>50% inside fences)
 5. Fixes dev term pronunciation (CLI → "C L I", JSON → "jason", etc.)
-6. Generates audio with Kokoro TTS, concatenates all sentences into one seamless buffer
-7. Plays audio while rendering word-by-word highlighting to `/dev/tty`
+6. **Hands the cleaned text to the local Kokoro daemon over a Unix socket** (or, if no daemon is running, spawns one)
+7. Daemon generates audio, plays it, and renders word-by-word highlighting to the user's terminal
 8. Background thread listens for keypress — any key interrupts instantly
 9. Cleans up display when done
+
+---
+
+## Daemon mode
+
+By default `claude-voice` runs a long-lived daemon (`python claude_voice.py --daemon`) that owns the Kokoro pipeline. The Stop hook is a thin client that connects to `~/.cache/claude-voice/daemon.sock` and ships the text over. No more reloading a 300MB model on every response.
+
+**Lifecycle**
+
+- The first time you trigger a response, the hook spawns the daemon and waits up to 15s for it to come up. That run pays the model-load cost (~6–9s).
+- Every response after that is warm: ~0.6s to first audio.
+- After 30 minutes of inactivity, the daemon exits to free memory. The next response transparently spawns a fresh one.
+
+**Files**
+
+| Path | Purpose |
+|------|---------|
+| `~/.cache/claude-voice/daemon.sock` | Unix socket the hook talks to |
+| `~/.cache/claude-voice/daemon.pid` | Daemon PID (best-effort, not used for locking) |
+| `~/.cache/claude-voice/daemon.log` | Daemon stdout/stderr + diagnostic log |
+
+If something feels stuck, `claude-voice daemon-status` is the first thing to check. `claude-voice daemon-stop` then a fresh request is the cheap reset.
 
 ---
 
@@ -170,7 +202,11 @@ Config lives at `~/.config/claude-voice/config.json`:
 claude-voice benchmark: ttfa=0.93s avg_gen=0.59s voice=af_heart engine=kokoro-82M local=true
 ```
 
-Warm TTFA (time to first audio) under 1 second. First run is ~6s due to model loading.
+| Scenario | Before (no daemon) | After (daemon) |
+|---|---|---|
+| First response in a session (cold) | ~6–9s | ~6–9s |
+| Subsequent responses (warm) | ~6–9s (model reloads every time) | **~0.6s** |
+| Stop-hook wall time (fire-and-forget) | seconds | **~230ms** |
 
 ---
 
