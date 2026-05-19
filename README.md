@@ -19,6 +19,7 @@ You talk to Claude with `/voice`. Now Claude talks back — with real-time word-
 - [Voices](#voices)
 - [Config](#config)
 - [How It Works](#how-it-works)
+- [Daemon mode](#daemon-mode)
 - [Benchmark](#benchmark)
 - [Why Not VoiceMode / ElevenLabs / OpenAI TTS?](#why-not-voicemode--elevenlabs--openai-tts)
 - [Requirements](#requirements)
@@ -48,6 +49,10 @@ One file. 21KB of Python. Zero API keys. It just works.
 - **Smart filtering** — skips code-heavy responses, strips markdown/URLs/tables, fixes dev pronunciations (CLI, API, JSON, nginx, kubectl)
 - **Interrupt on keypress** — press any key to stop immediately
 - **One-command setup** — `claude-voice setup` adds the hook automatically
+- **Background daemon (new)** — Kokoro loads once and stays in memory. Warm TTFA drops from ~6s to ~0.6s
+- **Multi-terminal routing (new)** — run Claude Code in five terminals at once and only the one you typed in speaks
+- **Per-terminal mute toggle (new)** — `claude-voice toggle` flips voice on/off for the current terminal only
+- **Highlight-and-speak hotkey (new)** — select any text in any app, press a key, and the daemon reads it back. Ships with a Hammerspoon snippet for the binding.
 
 ---
 
@@ -103,14 +108,29 @@ That's it. Restart Claude Code and every response will be spoken.
 ## Commands
 
 ```bash
-claude-voice setup              # install hook into Claude Code
+claude-voice setup              # install Stop + UserPromptSubmit hooks
 claude-voice demo               # run a polished demo (for screen recording)
 claude-voice benchmark          # measure latency, print shareable stats
-claude-voice on                 # enable
-claude-voice off                # disable (without removing the hook)
+claude-voice on                 # enable globally
+claude-voice off                # disable globally (without removing the hook)
 claude-voice --voices           # list all 12 voices
 claude-voice --voice am_fenrir "text"   # speak with a specific voice
 claude-voice --long "text"      # no truncation for long text
+claude-voice --no-daemon "text" # bypass the daemon; speak in-process
+
+# Per-terminal control
+claude-voice toggle             # flip voice on/off for THIS terminal
+claude-voice mute               # silence THIS terminal
+claude-voice unmute             # un-silence THIS terminal
+claude-voice claim              # force this terminal to be the speaker
+claude-voice unclaim            # release the active claim
+
+# On-demand speak
+claude-voice clip               # speak the macOS clipboard contents
+
+# Daemon control
+claude-voice daemon-status      # pid, idle time, active terminal, muted list
+claude-voice daemon-stop        # cleanly shut the daemon down
 ```
 
 ---
@@ -144,9 +164,12 @@ Config lives at `~/.config/claude-voice/config.json`:
   "min_chars": 30,
   "max_chars": 1500,
   "chime": true,
-  "enabled": true
+  "enabled": true,
+  "use_daemon": true
 }
 ```
+
+Set `"use_daemon": false` to go back to one-shot, in-process behavior (every response reloads the model). The default is `true`.
 
 ---
 
@@ -157,10 +180,62 @@ Config lives at `~/.config/claude-voice/config.json`:
 3. Strips markdown, code blocks, URLs, tables — keeps only speakable text
 4. Skips if response is mostly code (>50% inside fences)
 5. Fixes dev term pronunciation (CLI → "C L I", JSON → "jason", etc.)
-6. Generates audio with Kokoro TTS, concatenates all sentences into one seamless buffer
-7. Plays audio while rendering word-by-word highlighting to `/dev/tty`
+6. **Hands the cleaned text to the local Kokoro daemon over a Unix socket** (or, if no daemon is running, spawns one)
+7. Daemon generates audio, plays it, and renders word-by-word highlighting to the user's terminal
 8. Background thread listens for keypress — any key interrupts instantly
 9. Cleans up display when done
+
+---
+
+## Daemon mode
+
+By default `claude-voice` runs a long-lived daemon (`python claude_voice.py --daemon`) that owns the Kokoro pipeline. The Stop hook is a thin client that connects to `~/.cache/claude-voice/daemon.sock` and ships the text over. No more reloading a 300MB model on every response.
+
+**Lifecycle**
+
+- The first time you trigger a response, the hook spawns the daemon and waits up to 15s for it to come up. That run pays the model-load cost (~6–9s).
+- Every response after that is warm: ~0.6s to first audio.
+- After 30 minutes of inactivity, the daemon exits to free memory. The next response transparently spawns a fresh one.
+
+**Multi-terminal routing**
+
+Running Claude Code in multiple terminals at once used to be a problem: two responses finishing simultaneously meant two voices stepping on each other. The daemon fixes this by tracking an `active_tty` — only the terminal that "owns" the voice gets to speak; others are silently skipped.
+
+- The included `UserPromptSubmit` hook auto-claims the current terminal when you type a prompt. Natural flow: typed here → hear here.
+- Run `claude-voice claim` in any terminal to force-claim it.
+- Run `claude-voice unclaim` to clear the claim (every terminal becomes a candidate again).
+- Claims auto-expire after 10 minutes of inactivity.
+
+**Per-terminal mute toggle**
+
+Sometimes you want one terminal silent without disabling the whole hook. Run `claude-voice toggle` in any terminal to flip its voice on or off. Mute beats claim: a muted terminal stays silent even if it holds the active claim. Mute state lives in the daemon's memory, so it resets if the daemon restarts (idle timeout, manual stop) — explicit re-mute is safer than persistent surprise silence.
+
+**Highlight-and-speak hotkey**
+
+Sometimes you don't want every response read aloud — you just want to hear *that one paragraph*. Select any text in any app, press a hotkey, and the daemon speaks it on demand. Bypasses the mute/claim gates because the user explicitly asked for it.
+
+Install:
+
+```bash
+brew install --cask hammerspoon                            # the hotkey runner
+# grant Hammerspoon Accessibility access in System Settings
+cat integrations/hammerspoon-snippet.lua >> ~/.hammerspoon/init.lua
+# open Hammerspoon, click "Reload Config"
+```
+
+Default binding is **Cmd+Shift+T** ("T for talk") — change it in the snippet. Internally the hotkey sends Cmd+C to copy the current selection, then runs `claude-voice clip`, which `pbpaste`s and ships the text to the daemon.
+
+You can also bind it via Karabiner-Elements, Raycast, BetterTouchTool, or any other macOS hotkey tool — anything that can run `claude-voice clip` after a Cmd+C works. Hammerspoon is just the lightest dependency.
+
+**Files**
+
+| Path | Purpose |
+|------|---------|
+| `~/.cache/claude-voice/daemon.sock` | Unix socket the hook talks to |
+| `~/.cache/claude-voice/daemon.pid` | Daemon PID (best-effort, not used for locking) |
+| `~/.cache/claude-voice/daemon.log` | Daemon stdout/stderr + diagnostic log |
+
+If something feels stuck, `claude-voice daemon-status` is the first thing to check. `claude-voice daemon-stop` then a fresh request is the cheap reset.
 
 ---
 
@@ -170,7 +245,11 @@ Config lives at `~/.config/claude-voice/config.json`:
 claude-voice benchmark: ttfa=0.93s avg_gen=0.59s voice=af_heart engine=kokoro-82M local=true
 ```
 
-Warm TTFA (time to first audio) under 1 second. First run is ~6s due to model loading.
+| Scenario | Before (no daemon) | After (daemon) |
+|---|---|---|
+| First response in a session (cold) | ~6–9s | ~6–9s |
+| Subsequent responses (warm) | ~6–9s (model reloads every time) | **~0.6s** |
+| Stop-hook wall time (fire-and-forget) | seconds | **~230ms** |
 
 ---
 
