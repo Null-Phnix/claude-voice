@@ -50,6 +50,8 @@ One file. 21KB of Python. Zero API keys. It just works.
 - **Interrupt on keypress** — press any key to stop immediately
 - **One-command setup** — `claude-voice setup` adds the hook automatically
 - **Background daemon (new)** — Kokoro loads once and stays in memory. Warm TTFA drops from ~6s to ~0.6s
+- **Multi-terminal routing (new)** — run Claude Code in five terminals at once and only the one you typed in speaks
+- **Per-terminal mute toggle (new)** — `claude-voice toggle` flips voice on/off for the current terminal only
 
 ---
 
@@ -105,18 +107,25 @@ That's it. Restart Claude Code and every response will be spoken.
 ## Commands
 
 ```bash
-claude-voice setup              # install Stop hook into Claude Code
+claude-voice setup              # install Stop + UserPromptSubmit hooks
 claude-voice demo               # run a polished demo (for screen recording)
 claude-voice benchmark          # measure latency, print shareable stats
-claude-voice on                 # enable
-claude-voice off                # disable (without removing the hook)
+claude-voice on                 # enable globally
+claude-voice off                # disable globally (without removing the hook)
 claude-voice --voices           # list all 12 voices
 claude-voice --voice am_fenrir "text"   # speak with a specific voice
 claude-voice --long "text"      # no truncation for long text
 claude-voice --no-daemon "text" # bypass the daemon; speak in-process
 
+# Per-terminal control
+claude-voice toggle             # flip voice on/off for THIS terminal
+claude-voice mute               # silence THIS terminal
+claude-voice unmute             # un-silence THIS terminal
+claude-voice claim              # force this terminal to be the speaker
+claude-voice unclaim            # release the active claim
+
 # Daemon control
-claude-voice daemon-status      # show daemon pid + idle time
+claude-voice daemon-status      # pid, idle time, active terminal, muted list
 claude-voice daemon-stop        # cleanly shut the daemon down
 ```
 
@@ -183,6 +192,19 @@ By default `claude-voice` runs a long-lived daemon (`python claude_voice.py --da
 - The first time you trigger a response, the hook spawns the daemon and waits up to 15s for it to come up. That run pays the model-load cost (~6–9s).
 - Every response after that is warm: ~0.6s to first audio.
 - After 30 minutes of inactivity, the daemon exits to free memory. The next response transparently spawns a fresh one.
+
+**Multi-terminal routing**
+
+Running Claude Code in multiple terminals at once used to be a problem: two responses finishing simultaneously meant two voices stepping on each other. The daemon fixes this by tracking an `active_tty` — only the terminal that "owns" the voice gets to speak; others are silently skipped.
+
+- The included `UserPromptSubmit` hook auto-claims the current terminal when you type a prompt. Natural flow: typed here → hear here.
+- Run `claude-voice claim` in any terminal to force-claim it.
+- Run `claude-voice unclaim` to clear the claim (every terminal becomes a candidate again).
+- Claims auto-expire after 10 minutes of inactivity.
+
+**Per-terminal mute toggle**
+
+Sometimes you want one terminal silent without disabling the whole hook. Run `claude-voice toggle` in any terminal to flip its voice on or off. Mute beats claim: a muted terminal stays silent even if it holds the active claim. Mute state lives in the daemon's memory, so it resets if the daemon restarts (idle timeout, manual stop) — explicit re-mute is safer than persistent surprise silence.
 
 **Files**
 
