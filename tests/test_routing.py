@@ -182,6 +182,30 @@ class RoutingTests(unittest.TestCase):
         status = _send(self.sock_path, {"op": "status"})
         self.assertEqual(status.get("muted_ttys"), ["/dev/ttysA", "/dev/ttysB"])
 
+    # ── override flag (user-initiated speak bypasses both gates) ────
+
+    def test_override_bypasses_mute(self):
+        _send(self.sock_path, {"op": "mute", "tty_path": "/dev/ttysA"})
+        resp = _send(
+            self.sock_path,
+            {
+                "op": "speak", "text": "override", "tty_path": "/dev/ttysA",
+                "override": True,
+            },
+        )
+        self.assertEqual(resp.get("queued"), True)
+
+    def test_override_bypasses_claim(self):
+        _send(self.sock_path, {"op": "claim", "tty_path": "/dev/ttysA"})
+        resp = _send(
+            self.sock_path,
+            {
+                "op": "speak", "text": "override", "tty_path": "/dev/ttysB",
+                "override": True,
+            },
+        )
+        self.assertEqual(resp.get("queued"), True)
+
 
 if __name__ == "__main__":
     unittest.main()

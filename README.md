@@ -52,6 +52,7 @@ One file. 21KB of Python. Zero API keys. It just works.
 - **Background daemon (new)** — Kokoro loads once and stays in memory. Warm TTFA drops from ~6s to ~0.6s
 - **Multi-terminal routing (new)** — run Claude Code in five terminals at once and only the one you typed in speaks
 - **Per-terminal mute toggle (new)** — `claude-voice toggle` flips voice on/off for the current terminal only
+- **Highlight-and-speak hotkey (new)** — select any text in any app, press a key, and the daemon reads it back. Ships with a Hammerspoon snippet for the binding.
 
 ---
 
@@ -123,6 +124,9 @@ claude-voice mute               # silence THIS terminal
 claude-voice unmute             # un-silence THIS terminal
 claude-voice claim              # force this terminal to be the speaker
 claude-voice unclaim            # release the active claim
+
+# On-demand speak
+claude-voice clip               # speak the macOS clipboard contents
 
 # Daemon control
 claude-voice daemon-status      # pid, idle time, active terminal, muted list
@@ -205,6 +209,23 @@ Running Claude Code in multiple terminals at once used to be a problem: two resp
 **Per-terminal mute toggle**
 
 Sometimes you want one terminal silent without disabling the whole hook. Run `claude-voice toggle` in any terminal to flip its voice on or off. Mute beats claim: a muted terminal stays silent even if it holds the active claim. Mute state lives in the daemon's memory, so it resets if the daemon restarts (idle timeout, manual stop) — explicit re-mute is safer than persistent surprise silence.
+
+**Highlight-and-speak hotkey**
+
+Sometimes you don't want every response read aloud — you just want to hear *that one paragraph*. Select any text in any app, press a hotkey, and the daemon speaks it on demand. Bypasses the mute/claim gates because the user explicitly asked for it.
+
+Install:
+
+```bash
+brew install --cask hammerspoon                            # the hotkey runner
+# grant Hammerspoon Accessibility access in System Settings
+cat integrations/hammerspoon-snippet.lua >> ~/.hammerspoon/init.lua
+# open Hammerspoon, click "Reload Config"
+```
+
+Default binding is **Cmd+Shift+T** ("T for talk") — change it in the snippet. Internally the hotkey sends Cmd+C to copy the current selection, then runs `claude-voice clip`, which `pbpaste`s and ships the text to the daemon.
+
+You can also bind it via Karabiner-Elements, Raycast, BetterTouchTool, or any other macOS hotkey tool — anything that can run `claude-voice clip` after a Cmd+C works. Hammerspoon is just the lightest dependency.
 
 **Files**
 
