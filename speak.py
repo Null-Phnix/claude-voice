@@ -732,24 +732,28 @@ def _handle_client(conn: socket.socket) -> None:
         text = req.get("text", "")
         voice = req.get("voice") or load_config().get("voice", DEFAULT_VOICE)
         tty_path = req.get("tty_path") or "/dev/tty"
+        override = bool(req.get("override"))
 
         if not text.strip():
             conn.sendall(json.dumps({"error": "empty"}).encode() + b"\n")
             return
 
-        # Per-terminal mute: a tty explicitly toggled off never speaks.
-        if tty_path in _muted_ttys:
-            _daemon_log(f"skip: tty {tty_path} is muted")
-            conn.sendall(json.dumps({"skipped": "muted"}).encode() + b"\n")
-            return
+        # `override` skips both gates — user-initiated speak (e.g. `clip`) should
+        # always run, regardless of which tty is claimed or muted.
+        if not override:
+            # Per-terminal mute: a tty explicitly toggled off never speaks.
+            if tty_path in _muted_ttys:
+                _daemon_log(f"skip: tty {tty_path} is muted")
+                conn.sendall(json.dumps({"skipped": "muted"}).encode() + b"\n")
+                return
 
-        # Multi-terminal gating: if a fresh claim points elsewhere, skip
-        # silently so two simultaneous responses don't overlap.
-        stale = _active_tty and (time.monotonic() - _active_tty_t > ACTIVE_TTY_STALE)
-        if _active_tty and not stale and tty_path != _active_tty:
-            _daemon_log(f"skip: tty {tty_path} != active {_active_tty}")
-            conn.sendall(json.dumps({"skipped": "not_active_tty"}).encode() + b"\n")
-            return
+            # Multi-terminal gating: if a fresh claim points elsewhere, skip
+            # silently so two simultaneous responses don't overlap.
+            stale = _active_tty and (time.monotonic() - _active_tty_t > ACTIVE_TTY_STALE)
+            if _active_tty and not stale and tty_path != _active_tty:
+                _daemon_log(f"skip: tty {tty_path} != active {_active_tty}")
+                conn.sendall(json.dumps({"skipped": "not_active_tty"}).encode() + b"\n")
+                return
 
         # Ack the request immediately, then play synchronously under a lock so
         # a second speak request preempts (not overlaps) the first.
@@ -1027,6 +1031,52 @@ def cmd_unmute() -> None: _cmd_mute_op("unmute")
 def cmd_toggle_voice() -> None: _cmd_mute_op("toggle")
 
 
+def cmd_clip() -> None:
+    """Speak the current macOS clipboard contents.
+
+    Designed to be bound to a global hotkey (e.g. via Hammerspoon): the user
+    highlights any text on screen, presses the hotkey, the hotkey copies the
+    selection to the clipboard, then runs `claude-voice clip` — the daemon
+    speaks it immediately, bypassing the multi-terminal mute/claim gates.
+    """
+    try:
+        result = subprocess.run(
+            ["pbpaste"], capture_output=True, text=True, timeout=2.0
+        )
+        text = result.stdout
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        print(f"  {RED}clipboard read failed{RESET}: {e}")
+        return
+
+    text = clean_for_speech(text or "")
+    if not text.strip():
+        print(f"  {DIM}clipboard empty or unspeakable{RESET}")
+        return
+
+    cfg = load_config()
+    max_chars = cfg.get("max_chars", MAX_CHARS) * 4  # clip explicitly opts into longer text
+    if len(text) > max_chars:
+        text = text[:max_chars].rsplit(" ", 1)[0] + "..."
+
+    if not _ensure_daemon():
+        # No daemon and couldn't spawn one — fall back to in-process for this one shot.
+        try:
+            speak_and_highlight(text, cfg.get("voice", DEFAULT_VOICE), tty_path=_resolve_tty())
+        except Exception:
+            pass
+        return
+
+    resp = _send_to_daemon({
+        "op": "speak",
+        "text": text,
+        "voice": cfg.get("voice", DEFAULT_VOICE),
+        "tty_path": _resolve_tty(),
+        "override": True,
+    }, timeout=3.0)
+    if resp is None:
+        print(f"  {RED}daemon unreachable{RESET}")
+
+
 def cmd_daemon_stop() -> None:
     if not _daemon_alive():
         print(f"  {DIM}daemon not running{RESET}")
@@ -1039,6 +1089,7 @@ def main():
     SUBCOMMANDS = {
         "setup", "demo", "benchmark", "on", "off",
         "claim", "unclaim", "mute", "unmute", "toggle",
+        "clip",
         "daemon-status", "daemon-stop",
     }
     if len(sys.argv) >= 2 and sys.argv[1] in SUBCOMMANDS:
@@ -1053,6 +1104,7 @@ def main():
         elif cmd == "mute":          cmd_mute()
         elif cmd == "unmute":        cmd_unmute()
         elif cmd == "toggle":        cmd_toggle_voice()
+        elif cmd == "clip":          cmd_clip()
         elif cmd == "daemon-status": cmd_daemon_status()
         elif cmd == "daemon-stop":   cmd_daemon_stop()
         sys.exit(0)
