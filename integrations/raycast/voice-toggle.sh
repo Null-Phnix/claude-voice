@@ -10,7 +10,7 @@
 # @raycast.packageName Claude Voice
 
 # Documentation:
-# @raycast.description Toggle claude-voice TTS globally. Suggested hotkey: Cmd+Ctrl+V
+# @raycast.description Toggle claude-voice TTS globally. Suggested hotkey: Cmd+Ctrl+T
 # @raycast.author claude-voice
 
 "$HOME/.local/bin/claude-voice" toggle | sed $'s/\033\[[0-9;]*m//g' | xargs

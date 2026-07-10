@@ -215,7 +215,7 @@ Run Claude Code in five terminals and only the one you're typing in speaks:
 
 | Command | What it does | Suggested hotkey |
 |---|---|---|
-| Voice On/Off | toggle speech globally | ⌘⌃V |
+| Voice On/Off | toggle speech globally | ⌘⌃T |
 | Voice Stop Speaking | interrupt current playback (`claude-voice stop`) | ⌘⌃S |
 | Voice Speak Clipboard | read the clipboard aloud (`claude-voice clip`) | ⌘⌃C |
 
