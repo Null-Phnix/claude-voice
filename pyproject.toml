@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "claude-voice"
-version = "0.1.0"
-description = "TTS with karaoke-style word highlighting for Claude Code. Fully local, zero API keys, one file."
+version = "0.2.0"
+description = "TTS with karaoke-style word highlighting for Claude Code. Local Kokoro by default; OpenAI, ElevenLabs, Grok and custom providers optional."
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.11"
@@ -20,10 +20,13 @@ classifiers = [
     "Topic :: Multimedia :: Sound/Audio :: Speech",
 ]
 dependencies = [
-    "kokoro>=0.7",
     "sounddevice>=0.4",
     "numpy",
 ]
+
+[project.optional-dependencies]
+local = ["kokoro>=0.7"]
+all = ["kokoro>=0.7"]
 
 [project.urls]
 Homepage = "https://github.com/Null-Phnix/claude-voice"
