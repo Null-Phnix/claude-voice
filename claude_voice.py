@@ -14,8 +14,9 @@ Providers:
     custom       Any OpenAI-compatible /audio/speech endpoint
 
 Commands:
-    claude-voice setup              Install Stop hook + /voice slash command
-    claude-voice on | off | toggle  Enable / disable speech
+    claude-voice setup              Install hooks + /voice slash command
+    claude-voice on | off | toggle  Enable / disable speech globally
+    claude-voice mute | unmute      Mute / unmute this terminal only
     claude-voice status             Show current state
     claude-voice provider <name>    Switch TTS provider
     claude-voice voice <name>       Set voice for current provider
@@ -24,10 +25,13 @@ Commands:
     claude-voice speed <x>          Playback speed (e.g. 1.2)
     claude-voice volume <x>         Volume 0.0 - 1.0
     claude-voice theme <name>       UI theme (aurora/ember/violet/mint/mono)
+    claude-voice clip               Speak the clipboard (bind to a hotkey)
+    claude-voice daemon-status      Show warm-daemon state
+    claude-voice daemon-stop        Stop the daemon
     claude-voice demo               Run a polished demo
     claude-voice benchmark          Measure latency stats
     claude-voice doctor             Diagnose install problems
-    claude-voice uninstall          Remove hook + slash command
+    claude-voice uninstall          Remove hooks + slash command
     claude-voice "some text"        Speak arbitrary text
 """
 import argparse
@@ -39,6 +43,7 @@ import re
 import select
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -74,6 +79,15 @@ ELEVEN_CACHE_PATH = os.path.expanduser("~/.config/claude-voice/elevenlabs_voices
 SETTINGS_PATH = os.path.expanduser("~/.claude/settings.json")
 COMMAND_PATH = os.path.expanduser("~/.claude/commands/voice.md")
 SCRIPT_PATH = os.path.abspath(__file__)
+
+# ── daemon / runtime state ──
+RUNTIME_DIR = os.path.expanduser("~/.cache/claude-voice")
+SOCK_PATH = os.path.join(RUNTIME_DIR, "daemon.sock")
+PID_PATH = os.path.join(RUNTIME_DIR, "daemon.pid")
+LOG_PATH = os.path.join(RUNTIME_DIR, "daemon.log")
+DAEMON_IDLE_TIMEOUT = 1800            # seconds before idle daemon exits
+DAEMON_SPAWN_WAIT = 15                # max seconds to wait for cold-spawned daemon
+ACTIVE_TTY_STALE = 600                # claim auto-expires after 10 min
 
 # ── dev pronunciation fixes (local engines only — cloud models handle these) ──
 PRONOUNCE = {
@@ -240,6 +254,16 @@ _config = None
 _tty_fd = None
 _old_term = None
 
+# Daemon-only: serialize playback and track idle time for the idle-timeout exit.
+_playback_lock = threading.Lock()
+_daemon_idle_t0: float = 0.0
+
+# Multi-terminal routing: which tty currently owns the voice, when it claimed,
+# and a per-tty deny-list for the explicit-mute toggle.
+_active_tty: str | None = None
+_active_tty_t: float = 0.0
+_muted_ttys: set[str] = set()
+
 
 class ProviderError(Exception):
     pass
@@ -271,6 +295,7 @@ def default_config() -> dict:
         "volume": 1.0,
         "theme": "aurora",
         "chime": True,
+        "use_daemon": True,
         "min_chars": MIN_CHARS,
         "max_chars": MAX_CHARS,
         "window": WINDOW,
@@ -305,6 +330,14 @@ def load_config() -> dict:
     _config = cfg
     set_theme(cfg.get("theme", "aurora"))
     return _config
+
+
+def reload_config() -> dict:
+    """Force a fresh read — the daemon calls this so config edits made after
+    daemon start (provider switches, speed changes) still apply."""
+    global _config
+    _config = None
+    return load_config()
 
 
 def save_config(cfg: dict):
@@ -367,10 +400,16 @@ signal.signal(signal.SIGINT, _handle_signal)
 signal.signal(signal.SIGTERM, _handle_signal)
 
 
-def get_tty():
+def get_tty(tty_path: str = "/dev/tty"):
+    """Open a writable tty for karaoke rendering.
+
+    `tty_path` defaults to the controlling terminal of the current process.
+    The daemon passes the client's tty path here so output lands in the
+    user's terminal, not the daemon's (detached) one.
+    """
     global _tty
     try:
-        _tty = open("/dev/tty", "w")
+        _tty = open(tty_path, "w")
     except OSError:
         _tty = sys.stderr
     return _tty
@@ -390,15 +429,19 @@ def visible_len(s: str) -> int:
     return len(re.sub(r"\033\[[0-9;]*m", "", s))
 
 
-def _start_keypress_listener():
-    """Background thread: any keypress sets _interrupted and stops audio."""
+def _start_keypress_listener(tty_path: str = "/dev/tty"):
+    """Background thread: any keypress sets _interrupted and stops audio.
+
+    `tty_path` lets the daemon listen on the client's terminal rather than
+    its own (the daemon has no controlling tty when detached).
+    """
     global _tty_fd, _old_term
 
     def _listen():
         global _interrupted, _tty_fd, _old_term
         fd = None
         try:
-            fd = os.open("/dev/tty", os.O_RDONLY)
+            fd = os.open(tty_path, os.O_RDONLY)
             _tty_fd = fd
             _old_term = termios.tcgetattr(fd)
             tty.setraw(fd)
@@ -926,7 +969,7 @@ def mini_bar(current: int, total: int, width: int = 22) -> str:
 # ── core speak loop ──
 
 def speak_and_highlight(text: str, provider: str | None = None, voice: str | None = None,
-                        show_stats: bool = False) -> dict:
+                        show_stats: bool = False, tty_path: str = "/dev/tty") -> dict:
     global _interrupted
     cfg = load_config()
     provider = provider or cfg.get("provider", "kokoro")
@@ -941,7 +984,7 @@ def speak_and_highlight(text: str, provider: str | None = None, voice: str | Non
     all_words = text.split()
     total_words = len(all_words)
 
-    out = get_tty()
+    out = get_tty(tty_path)
     out.write(HIDE_CURSOR)
     spinner = Spinner(out, f"synthesizing · {provider} · {voice or 'default'}").start()
     try:
@@ -966,7 +1009,7 @@ def speak_and_highlight(text: str, provider: str | None = None, voice: str | Non
     if chime:
         play_chime_start()
 
-    _start_keypress_listener()
+    _start_keypress_listener(tty_path)
 
     width = term_width(out)
     out.write(f"{render_header(provider, voice, 0, audio_duration)}\n\n")
@@ -1065,6 +1108,321 @@ def extract_hook_text(raw: str) -> str:
     return ""
 
 
+# ── daemon ──
+#
+# Why a daemon exists: loading Kokoro takes ~6–10s, and the Claude Code Stop
+# hook fires a fresh Python process for every assistant response. Without a
+# daemon, every response repays that cold-start. The daemon loads the model
+# once and accepts requests over a Unix socket. Cold TTFA stays ~6–10s on the
+# very first response, but warm TTFA drops to ~0.6s. Cloud providers also
+# benefit: the hook client returns in ~50ms instead of blocking Claude Code.
+
+
+def _daemon_log(msg: str) -> None:
+    try:
+        os.makedirs(RUNTIME_DIR, exist_ok=True)
+        with open(LOG_PATH, "a") as f:
+            f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+    except OSError:
+        pass
+
+
+def _resolve_tty() -> str:
+    """Best-effort: a stable path to the user's controlling terminal.
+
+    Hooks are launched with stdin/stdout/stderr as pipes, so `ttyname(fd)`
+    on those fds raises. We fall back to opening /dev/tty (which always
+    refers to the *calling* process's controlling terminal) and ttyname
+    that fd — that gives a stable identifier like `/dev/ttys001`.
+    """
+    for fd in (2, 1, 0):
+        try:
+            return os.ttyname(fd)
+        except OSError:
+            continue
+    fd = None
+    try:
+        fd = os.open("/dev/tty", os.O_RDONLY)
+        return os.ttyname(fd)
+    except OSError:
+        return "/dev/tty"
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def _daemon_alive() -> bool:
+    """Return True if a daemon is reachable on the socket."""
+    if not os.path.exists(SOCK_PATH):
+        return False
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(0.5)
+        s.connect(SOCK_PATH)
+        s.sendall(json.dumps({"op": "ping"}).encode() + b"\n")
+        resp = s.recv(256)
+        s.close()
+        return b'"ok"' in resp
+    except (OSError, socket.timeout):
+        return False
+
+
+def _spawn_daemon() -> None:
+    """Spawn the daemon process detached. Returns immediately."""
+    os.makedirs(RUNTIME_DIR, exist_ok=True)
+    log = open(LOG_PATH, "a")
+    subprocess.Popen(
+        [sys.executable, SCRIPT_PATH, "--daemon"],
+        stdin=subprocess.DEVNULL,
+        stdout=log,
+        stderr=log,
+        start_new_session=True,
+        close_fds=True,
+    )
+
+
+def _send_to_daemon(payload: dict, timeout: float = 2.0) -> dict | None:
+    """Send a request to the daemon. Returns the parsed response or None."""
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect(SOCK_PATH)
+        s.sendall(json.dumps(payload).encode() + b"\n")
+        buf = b""
+        while b"\n" not in buf and len(buf) < 8192:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+        s.close()
+        line = buf.split(b"\n", 1)[0]
+        return json.loads(line.decode("utf-8", errors="replace"))
+    except (OSError, socket.timeout, json.JSONDecodeError):
+        return None
+
+
+def _ensure_daemon(wait_seconds: int = DAEMON_SPAWN_WAIT) -> bool:
+    """Spawn the daemon if not running and wait up to `wait_seconds` for ready.
+
+    Returns True if a live daemon is reachable when the function returns.
+    """
+    if _daemon_alive():
+        return True
+    _spawn_daemon()
+    for _ in range(wait_seconds * 5):
+        time.sleep(0.2)
+        if _daemon_alive():
+            return True
+    return False
+
+
+def _handle_client(conn: socket.socket) -> None:
+    """One connection's lifecycle. Runs on a daemon worker thread."""
+    global _daemon_idle_t0, _interrupted, _active_tty, _active_tty_t
+    try:
+        conn.settimeout(2.0)
+        buf = b""
+        while b"\n" not in buf and len(buf) < 2_000_000:
+            chunk = conn.recv(8192)
+            if not chunk:
+                break
+            buf += chunk
+        line = buf.split(b"\n", 1)[0]
+        if not line:
+            return
+        req = json.loads(line.decode("utf-8", errors="replace"))
+        _daemon_idle_t0 = time.monotonic()
+
+        op = req.get("op", "speak")
+
+        if op == "ping":
+            conn.sendall(json.dumps({"ok": True}).encode() + b"\n")
+            return
+
+        if op == "shutdown":
+            conn.sendall(json.dumps({"ok": True}).encode() + b"\n")
+            _daemon_log("shutdown requested")
+            os.kill(os.getpid(), signal.SIGTERM)
+            return
+
+        if op == "claim":
+            _active_tty = req.get("tty_path") or _active_tty
+            _active_tty_t = time.monotonic()
+            _daemon_log(f"claim: {_active_tty}")
+            conn.sendall(json.dumps({"ok": True, "active_tty": _active_tty}).encode() + b"\n")
+            return
+
+        if op == "unclaim":
+            _daemon_log(f"unclaim (was {_active_tty})")
+            _active_tty = None
+            _active_tty_t = 0.0
+            conn.sendall(json.dumps({"ok": True}).encode() + b"\n")
+            return
+
+        if op in ("mute", "unmute", "toggle"):
+            tty_path = req.get("tty_path") or ""
+            if not tty_path:
+                conn.sendall(json.dumps({"error": "no tty_path"}).encode() + b"\n")
+                return
+            if op == "mute":
+                _muted_ttys.add(tty_path)
+            elif op == "unmute":
+                _muted_ttys.discard(tty_path)
+            else:  # toggle
+                if tty_path in _muted_ttys:
+                    _muted_ttys.discard(tty_path)
+                else:
+                    _muted_ttys.add(tty_path)
+            muted = tty_path in _muted_ttys
+            _daemon_log(f"{op}: {tty_path} -> {'muted' if muted else 'unmuted'}")
+            conn.sendall(json.dumps({"ok": True, "muted": muted}).encode() + b"\n")
+            return
+
+        if op == "status":
+            stale = _active_tty and (time.monotonic() - _active_tty_t > ACTIVE_TTY_STALE)
+            conn.sendall(json.dumps({
+                "ok": True,
+                "pid": os.getpid(),
+                "idle_s": time.monotonic() - _daemon_idle_t0,
+                "active_tty": None if stale else _active_tty,
+                "active_tty_age_s": (time.monotonic() - _active_tty_t) if _active_tty else None,
+                "muted_ttys": sorted(_muted_ttys),
+            }).encode() + b"\n")
+            return
+
+        # op == "speak"
+        # Config may have changed since daemon start (provider switch, speed,
+        # theme, on/off) — always re-read it for a speak request.
+        cfg = reload_config()
+        text = req.get("text", "")
+        provider = req.get("provider") or cfg.get("provider", "kokoro")
+        voice = req.get("voice") or current_voice(cfg, provider)
+        tty_path = req.get("tty_path") or "/dev/tty"
+        override = bool(req.get("override"))
+
+        if not text.strip():
+            conn.sendall(json.dumps({"error": "empty"}).encode() + b"\n")
+            return
+
+        # `override` skips both gates — user-initiated speak (e.g. `clip`) should
+        # always run, regardless of which tty is claimed or muted.
+        if not override:
+            # Per-terminal mute: a tty explicitly toggled off never speaks.
+            if tty_path in _muted_ttys:
+                _daemon_log(f"skip: tty {tty_path} is muted")
+                conn.sendall(json.dumps({"skipped": "muted"}).encode() + b"\n")
+                return
+
+            # Multi-terminal gating: if a fresh claim points elsewhere, skip
+            # silently so two simultaneous responses don't overlap.
+            stale = _active_tty and (time.monotonic() - _active_tty_t > ACTIVE_TTY_STALE)
+            if _active_tty and not stale and tty_path != _active_tty:
+                _daemon_log(f"skip: tty {tty_path} != active {_active_tty}")
+                conn.sendall(json.dumps({"skipped": "not_active_tty"}).encode() + b"\n")
+                return
+
+        # Ack the request immediately, then play synchronously under a lock so
+        # a second speak request preempts (not overlaps) the first.
+        conn.sendall(json.dumps({"queued": True}).encode() + b"\n")
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+        # Preempt any in-progress playback
+        _interrupted = True
+        if sd is not None:
+            sd.stop()
+
+        with _playback_lock:
+            _interrupted = False
+            try:
+                speak_and_highlight(text, provider=provider, voice=voice, tty_path=tty_path)
+            except Exception as e:
+                _daemon_log(f"playback error: {e}")
+    except (json.JSONDecodeError, OSError, ValueError) as e:
+        try:
+            conn.sendall(json.dumps({"error": str(e)}).encode() + b"\n")
+        except OSError:
+            pass
+    finally:
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+
+def cmd_daemon(args=None) -> None:
+    """Run as TTS daemon. Warms the local model once, serves the Unix socket."""
+    global _daemon_idle_t0
+
+    os.makedirs(RUNTIME_DIR, exist_ok=True)
+    if _daemon_alive():
+        _daemon_log("daemon already running, exiting")
+        return
+
+    # Stale socket cleanup — a prior daemon that crashed without unlinking.
+    try:
+        os.unlink(SOCK_PATH)
+    except FileNotFoundError:
+        pass
+
+    try:
+        with open(PID_PATH, "w") as f:
+            f.write(str(os.getpid()))
+    except OSError:
+        pass
+
+    # Warm the local model only when it's the active provider; cloud
+    # providers have nothing to preload and shouldn't require kokoro.
+    if load_config().get("provider", "kokoro") == "kokoro":
+        _daemon_log("loading kokoro model...")
+        t0 = time.monotonic()
+        try:
+            get_pipe()
+            _daemon_log(f"kokoro loaded in {time.monotonic()-t0:.2f}s")
+        except ProviderError as e:
+            _daemon_log(f"kokoro unavailable ({e}) — serving anyway")
+
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(SOCK_PATH)
+    os.chmod(SOCK_PATH, 0o600)
+    srv.listen(8)
+    srv.settimeout(5.0)
+    _daemon_log(f"listening on {SOCK_PATH}")
+
+    _daemon_idle_t0 = time.monotonic()
+
+    def _cleanup(*_args):
+        for path in (SOCK_PATH, PID_PATH):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _cleanup)
+    signal.signal(signal.SIGINT, _cleanup)
+
+    while True:
+        if time.monotonic() - _daemon_idle_t0 > DAEMON_IDLE_TIMEOUT:
+            _daemon_log("idle timeout, exiting")
+            _cleanup()
+
+        try:
+            conn, _ = srv.accept()
+        except socket.timeout:
+            continue
+        except OSError as e:
+            _daemon_log(f"accept error: {e}")
+            continue
+
+        threading.Thread(target=_handle_client, args=(conn,), daemon=True).start()
+
+
 # ── setup / uninstall ──
 
 def _invoker() -> str:
@@ -1078,7 +1436,7 @@ def _invoker() -> str:
 
 
 SLASH_TEMPLATE = """---
-description: "Control voice output — on, off, status, provider <name>, voice <name>, speed <x>, volume <x>, theme <name>, voices"
+description: "Control voice output — on, off, mute, status, provider <name>, voice <name>, speed <x>, volume <x>, theme <name>, voices"
 allowed-tools: "Bash({invoker} slash:*)"
 ---
 
@@ -1120,6 +1478,7 @@ def cmd_setup(args=None):
 
     settings = _load_settings()
     hooks = settings.get("hooks", {})
+
     stop_hooks = [h for h in hooks.get("Stop", []) if not _is_our_hook(h)]
     stop_hooks.append({
         "matcher": "",
@@ -1131,6 +1490,21 @@ def cmd_setup(args=None):
         }],
     })
     hooks["Stop"] = stop_hooks
+
+    # UserPromptSubmit auto-claims the current terminal so a Stop hook in a
+    # different tab does not also speak when responses finish simultaneously.
+    prompt_hooks = [h for h in hooks.get("UserPromptSubmit", []) if not _is_our_hook(h)]
+    prompt_hooks.append({
+        "matcher": "",
+        "hooks": [{
+            "type": "command",
+            "command": f"{invoker} claim",
+            "timeout": 5,
+            "async": True,
+        }],
+    })
+    hooks["UserPromptSubmit"] = prompt_hooks
+
     settings["hooks"] = hooks
     _save_settings(settings)
 
@@ -1140,7 +1514,7 @@ def cmd_setup(args=None):
 
     provider = cfg.get("provider", "kokoro")
     print(f"\n  {GREEN}✓{RESET} {BOLD}claude-voice v{VERSION} installed{RESET}")
-    print(f"    {LABEL}Stop hook{RESET}      {SETTINGS_PATH}")
+    print(f"    {LABEL}hooks{RESET}          Stop (speak) + UserPromptSubmit (claim terminal)")
     print(f"    {LABEL}slash command{RESET}  {COMMAND_PATH}  {DIM}→ /voice in Claude Code{RESET}")
     print(f"    {LABEL}config{RESET}         {CONFIG_PATH}")
     print(f"    {LABEL}provider{RESET}       {provider} · {current_voice(cfg, provider)}")
@@ -1151,16 +1525,20 @@ def cmd_setup(args=None):
 def cmd_uninstall(args=None):
     settings = _load_settings()
     hooks = settings.get("hooks", {})
-    before = len(hooks.get("Stop", []))
-    hooks["Stop"] = [h for h in hooks.get("Stop", []) if not _is_our_hook(h)]
-    removed = before - len(hooks["Stop"])
-    if not hooks["Stop"]:
-        del hooks["Stop"]
+    removed = 0
+    for event in list(hooks):
+        before = len(hooks[event])
+        hooks[event] = [h for h in hooks[event] if not _is_our_hook(h)]
+        removed += before - len(hooks[event])
+        if not hooks[event]:
+            del hooks[event]
     settings["hooks"] = hooks
     _save_settings(settings)
     had_cmd = os.path.exists(COMMAND_PATH)
     if had_cmd:
         os.unlink(COMMAND_PATH)
+    if _daemon_alive():
+        _send_to_daemon({"op": "shutdown"}, timeout=1.0)
     print(f"  {GREEN}✓{RESET} removed {removed} hook(s)"
           + (f" and {COMMAND_PATH}" if had_cmd else ""))
     print(f"  {DIM}config kept at {CONFIG_PATH} — delete it manually if you want a clean slate{RESET}")
@@ -1179,12 +1557,6 @@ def cmd_toggle_state(enable: bool | None, quiet: bool = False) -> str:
     return state
 
 
-def _key_status(cfg: dict, provider: str) -> str:
-    if not PROVIDERS[provider]["needs_key"]:
-        return "not needed"
-    return "set" if get_key(cfg, provider) else "missing"
-
-
 def _hook_installed() -> bool:
     return any(_is_our_hook(h) for h in _load_settings().get("hooks", {}).get("Stop", []))
 
@@ -1198,13 +1570,22 @@ def cmd_status(args=None):
     for p in ("openai", "elevenlabs", "grok"):
         ok = bool(get_key(cfg, p))
         keys.append(f"{p} {GREEN}✓{RESET}" if ok else f"{DIM}{p} ✗{RESET}")
+    if _daemon_alive():
+        d = _send_to_daemon({"op": "status"}, timeout=1.0) or {}
+        daemon_line = f"{GREEN}running{RESET} {DIM}(pid {d.get('pid', '?')}, warm){RESET}"
+        muted_here = _resolve_tty() in (d.get("muted_ttys") or [])
+    else:
+        daemon_line = f"{DIM}not running (starts on first speak){RESET}"
+        muted_here = False
     print(f"\n  {BOLD}claude-voice{RESET} {LABEL}v{VERSION}{RESET}")
     print(f"  {LABEL}{'─' * 44}{RESET}")
-    print(f"  {LABEL}state{RESET}      {state}")
+    print(f"  {LABEL}state{RESET}      {state}"
+          + (f"   {RED}(this terminal muted){RESET}" if muted_here else ""))
     print(f"  {LABEL}provider{RESET}   {provider_dot(provider)} {provider}  {DIM}{PROVIDERS[provider]['blurb']}{RESET}")
     print(f"  {LABEL}voice{RESET}      {current_voice(cfg, provider) or 'system default'}")
     print(f"  {LABEL}speed{RESET}      {cfg.get('speed', 1.0)}×   {LABEL}volume{RESET} {int(cfg.get('volume', 1.0) * 100)}%")
     print(f"  {LABEL}theme{RESET}      {cfg.get('theme', 'aurora')}")
+    print(f"  {LABEL}daemon{RESET}     {daemon_line}")
     print(f"  {LABEL}hook{RESET}       {'installed' if _hook_installed() else RED + 'not installed — run claude-voice setup' + RESET}")
     print(f"  {LABEL}/voice{RESET}     {'installed' if os.path.exists(COMMAND_PATH) else RED + 'not installed — run claude-voice setup' + RESET}")
     print(f"  {LABEL}keys{RESET}       {' · '.join(keys)}")
@@ -1384,6 +1765,127 @@ def cmd_key(args):
     print(f"  {GREEN}✓{RESET} {provider} key saved to {CONFIG_PATH} {DIM}(chmod 600){RESET}")
 
 
+# ── per-terminal routing commands ──
+
+def cmd_claim(args=None) -> None:
+    """Mark the current terminal as the voice owner.
+
+    Fire-and-forget: if no daemon is running, do nothing rather than blocking
+    the UserPromptSubmit hook for a cold spawn. The next speak request will
+    spawn the daemon, and the following prompt will re-claim.
+    """
+    if not _daemon_alive():
+        return
+    _send_to_daemon({"op": "claim", "tty_path": _resolve_tty()}, timeout=1.0)
+
+
+def cmd_unclaim(args=None) -> None:
+    if not _daemon_alive():
+        return
+    _send_to_daemon({"op": "unclaim"}, timeout=1.0)
+
+
+def _mute_op(op: str) -> tuple[bool | None, str]:
+    """Run a mute/unmute op against the daemon for this terminal.
+
+    Returns (muted_state_or_None_on_error, tty_path).
+    """
+    tty_path = _resolve_tty()
+    if not _ensure_daemon():
+        return None, tty_path
+    resp = _send_to_daemon({"op": op, "tty_path": tty_path}, timeout=1.5) or {}
+    return resp.get("muted"), tty_path
+
+
+def _print_mute_result(muted: bool | None, tty_path: str):
+    if muted is True:
+        print(f"  {RED}voice muted{RESET} for this terminal  {DIM}({tty_path}){RESET}")
+    elif muted is False:
+        print(f"  {GREEN}voice live{RESET} for this terminal  {DIM}({tty_path}){RESET}")
+    else:
+        print(f"  {RED}✗{RESET} daemon could not be reached")
+
+
+def cmd_mute(args=None):
+    _print_mute_result(*_mute_op("mute"))
+
+
+def cmd_unmute(args=None):
+    _print_mute_result(*_mute_op("unmute"))
+
+
+def cmd_clip(args=None) -> None:
+    """Speak the current clipboard contents.
+
+    Designed to be bound to a global hotkey (see integrations/): highlight
+    text anywhere, press the hotkey, hear it. Bypasses mute/claim gating
+    because it's explicitly user-initiated.
+    """
+    text = ""
+    for cmd in (["pbpaste"], ["wl-paste", "--no-newline"],
+                ["xclip", "-selection", "clipboard", "-o"]):
+        if shutil.which(cmd[0]):
+            try:
+                text = subprocess.run(cmd, capture_output=True, text=True, timeout=2.0).stdout
+                break
+            except (subprocess.TimeoutExpired, OSError):
+                continue
+    else:
+        print(f"  {RED}✗{RESET} no clipboard tool found (pbpaste / wl-paste / xclip)")
+        return
+
+    text = clean_for_speech(text or "")
+    if not text.strip():
+        print(f"  {DIM}clipboard empty or unspeakable{RESET}")
+        return
+
+    cfg = load_config()
+    max_chars = cfg.get("max_chars", MAX_CHARS) * 4  # clip explicitly opts into longer text
+    if len(text) > max_chars:
+        text = text[:max_chars].rsplit(" ", 1)[0] + "..."
+
+    if not _ensure_daemon():
+        # No daemon and couldn't spawn one — fall back to in-process for this one shot.
+        try:
+            speak_and_highlight(text, tty_path=_resolve_tty())
+        except Exception:
+            pass
+        return
+
+    resp = _send_to_daemon({
+        "op": "speak",
+        "text": text,
+        "provider": cfg.get("provider", "kokoro"),
+        "tty_path": _resolve_tty(),
+        "override": True,
+    }, timeout=3.0)
+    if resp is None:
+        print(f"  {RED}✗{RESET} daemon unreachable")
+
+
+def cmd_daemon_status(args=None) -> None:
+    if not _daemon_alive():
+        print(f"  {DIM}daemon not running (starts on first speak){RESET}")
+        return
+    resp = _send_to_daemon({"op": "status"}, timeout=1.0) or {}
+    pid = resp.get("pid", "?")
+    idle = resp.get("idle_s")
+    idle_str = f"{idle:.0f}s" if isinstance(idle, (int, float)) else "?"
+    active = resp.get("active_tty") or f"{DIM}(none){RESET}"
+    print(f"  {GREEN}daemon running{RESET}  pid={pid}  idle={idle_str}  active_tty={active}")
+    muted = resp.get("muted_ttys") or []
+    if muted:
+        print(f"  {RED}muted{RESET}: {', '.join(muted)}")
+
+
+def cmd_daemon_stop(args=None) -> None:
+    if not _daemon_alive():
+        print(f"  {DIM}daemon not running{RESET}")
+        return
+    _send_to_daemon({"op": "shutdown"}, timeout=1.0)
+    print(f"  daemon stopped")
+
+
 def cmd_demo(args=None):
     cfg = load_config()
     provider = cfg.get("provider", "kokoro")
@@ -1470,6 +1972,9 @@ def cmd_doctor(args=None):
     if PROVIDERS[provider]["needs_key"]:
         check(f"API key for current provider ({provider})", bool(get_key(cfg, provider)),
               f"claude-voice key {provider} <key>")
+    daemon = _daemon_alive()
+    mark = f"{GREEN}✓{RESET}" if daemon else f"{DIM}·{RESET}"
+    print(f"  {mark} daemon {'running (warm)' if daemon else 'not running — fine, spawns on first speak'}")
     print(f"\n  {LABEL}config:{RESET} {CONFIG_PATH}")
     print(f"  {LABEL}enabled:{RESET} {cfg.get('enabled', True)} · "
           f"{LABEL}provider:{RESET} {provider} · "
@@ -1496,6 +2001,13 @@ def cmd_slash(args):
         if action in ("on", "off", "toggle"):
             state = cmd_toggle_state({"on": True, "off": False}.get(action), quiet=True)
             print(f"voice output is now {state.upper()} ({plain_status()})")
+        elif action in ("mute", "unmute"):
+            muted, tty_path = _mute_op(action)
+            if muted is None:
+                print("error: daemon unreachable")
+            else:
+                print(f"this terminal ({tty_path}) is now {'MUTED' if muted else 'LIVE'} "
+                      "(other terminals unaffected)")
         elif action == "provider" and rest:
             name = resolve_provider(rest[0])
             cfg["provider"] = name
@@ -1532,7 +2044,7 @@ def cmd_slash(args):
         elif action == "providers":
             print("providers: " + ", ".join(f"{p} ({PROVIDERS[p]['blurb']})" for p in PROVIDERS))
         else:
-            print("usage: /voice [on|off|toggle|status|provider <name>|voice <name>|"
+            print("usage: /voice [on|off|toggle|mute|unmute|status|provider <name>|voice <name>|"
                   "speed <x>|volume <x>|theme <name>|voices|providers]")
     except (ProviderError, ValueError) as e:
         print(f"error: {e}")
@@ -1546,6 +2058,14 @@ COMMANDS = {
     "on": lambda a: cmd_toggle_state(True),
     "off": lambda a: cmd_toggle_state(False),
     "toggle": lambda a: cmd_toggle_state(None),
+    "mute": cmd_mute,
+    "unmute": cmd_unmute,
+    "claim": cmd_claim,
+    "unclaim": cmd_unclaim,
+    "clip": cmd_clip,
+    "daemon": cmd_daemon,
+    "daemon-status": cmd_daemon_status,
+    "daemon-stop": cmd_daemon_stop,
     "status": cmd_status,
     "provider": cmd_provider,
     "providers": lambda a: cmd_provider([]),
@@ -1579,8 +2099,15 @@ def main():
     parser.add_argument("--voice", "-v", default=None, help="Voice for this run")
     parser.add_argument("--voices", action="store_true", help="List voices (legacy)")
     parser.add_argument("--long", action="store_true", help="No truncation — speak full text")
+    parser.add_argument("--daemon", action="store_true", help="Run as TTS daemon (internal)")
+    parser.add_argument("--no-daemon", action="store_true",
+                        help="Force in-process speak; never spawn or use the daemon")
     parser.add_argument("--version", action="version", version=f"claude-voice {VERSION}")
     args = parser.parse_args()
+
+    if args.daemon:
+        cmd_daemon()
+        sys.exit(0)
 
     if args.voices:
         cmd_voices([args.provider] if args.provider else [])
@@ -1616,8 +2143,26 @@ def main():
         if not args.long and len(text) > max_chars:
             text = text[:max_chars].rsplit(" ", 1)[0] + "..."
 
+    tty_path = _resolve_tty()
+    use_daemon = cfg.get("use_daemon", True) and not args.no_daemon
+
+    if use_daemon and _ensure_daemon():
+        resp = _send_to_daemon({
+            "op": "speak",
+            "text": text,
+            "provider": provider or cfg.get("provider", "kokoro"),
+            "voice": args.voice,
+            "tty_path": tty_path,
+        }, timeout=5.0)
+        # "queued" → the daemon is speaking; "skipped" → it deliberately
+        # declined (muted / another terminal owns the voice). Either way,
+        # do NOT fall through to in-process playback.
+        if resp is not None and ("queued" in resp or "skipped" in resp):
+            sys.exit(0)
+        # Daemon reachable but request errored — fall through to in-process.
+
     try:
-        speak_and_highlight(text, provider=provider, voice=args.voice)
+        speak_and_highlight(text, provider=provider, voice=args.voice, tty_path=tty_path)
     except Exception as e:
         if _tty:
             _tty.write(SHOW_CURSOR)
