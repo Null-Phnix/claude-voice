@@ -1426,9 +1426,10 @@ def cmd_daemon(args=None) -> None:
 # ── setup / uninstall ──
 
 def _invoker() -> str:
+    # Absolute path: hook environments don't always share the shell's PATH.
     exe = shutil.which("claude-voice")
-    if exe:
-        return "claude-voice"
+    if exe and " " not in exe:
+        return exe
     py = sys.executable
     if " " in py or " " in SCRIPT_PATH:
         return f'"{py}" "{SCRIPT_PATH}"'
