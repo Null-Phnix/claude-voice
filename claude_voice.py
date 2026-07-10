@@ -1248,6 +1248,15 @@ def _handle_client(conn: socket.socket) -> None:
             os.kill(os.getpid(), signal.SIGTERM)
             return
 
+        if op == "stop":
+            # Interrupt current playback (hotkey "shut up" button).
+            _interrupted = True
+            if sd is not None:
+                sd.stop()
+            _daemon_log("stop requested")
+            conn.sendall(json.dumps({"ok": True}).encode() + b"\n")
+            return
+
         if op == "claim":
             _active_tty = req.get("tty_path") or _active_tty
             _active_tty_t = time.monotonic()
@@ -1864,6 +1873,15 @@ def cmd_clip(args=None) -> None:
         print(f"  {RED}✗{RESET} daemon unreachable")
 
 
+def cmd_stop(args=None) -> None:
+    """Interrupt whatever the daemon is currently speaking."""
+    if not _daemon_alive():
+        print(f"  {DIM}nothing speaking (daemon not running){RESET}")
+        return
+    _send_to_daemon({"op": "stop"}, timeout=1.0)
+    print(f"  {GREEN}✓{RESET} stopped")
+
+
 def cmd_daemon_status(args=None) -> None:
     if not _daemon_alive():
         print(f"  {DIM}daemon not running (starts on first speak){RESET}")
@@ -2064,6 +2082,7 @@ COMMANDS = {
     "claim": cmd_claim,
     "unclaim": cmd_unclaim,
     "clip": cmd_clip,
+    "stop": cmd_stop,
     "daemon": cmd_daemon,
     "daemon-status": cmd_daemon_status,
     "daemon-stop": cmd_daemon_stop,

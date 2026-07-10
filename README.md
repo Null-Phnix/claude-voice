@@ -209,9 +209,19 @@ Run Claude Code in five terminals and only the one you're typing in speaks:
 
 ---
 
-## Highlight-and-speak hotkey
+## Hotkeys
 
-Select text in *any* app, press a hotkey, hear it. `claude-voice clip` reads the clipboard and ships it to the daemon, bypassing mute/claim gating (it's user-initiated). See [`integrations/hammerspoon-snippet.lua`](integrations/hammerspoon-snippet.lua) for the macOS binding (Cmd+Shift+T by default).
+[`integrations/raycast/`](integrations/raycast/) ships three Raycast script commands:
+
+| Command | What it does | Suggested hotkey |
+|---|---|---|
+| Voice On/Off | toggle speech globally | ⌘⌃V |
+| Voice Stop Speaking | interrupt current playback (`claude-voice stop`) | ⌘⌃S |
+| Voice Speak Clipboard | read the clipboard aloud (`claude-voice clip`) | ⌘⌃C |
+
+Setup: Raycast → Settings → Extensions → **+** → *Add Script Directory* → pick `integrations/raycast/`, then record a hotkey on each command. ⌘⌃ combos are chosen to stay clear of terminal multiplexers (tmux/herdr use plain ctrl/alt) and standard macOS shortcuts.
+
+Prefer Hammerspoon? [`integrations/hammerspoon-snippet.lua`](integrations/hammerspoon-snippet.lua) binds highlight-and-speak (select text in any app, press the key, hear it via `claude-voice clip`).
 
 ---
 
