@@ -7,11 +7,12 @@ import claude_voice as cv
 
 
 class ClaimHookTests(unittest.TestCase):
-    def run_claim(self, payload, alive=True):
+    def run_claim(self, payload, alive=True, enabled=True):
         sent = []
         with (
             mock.patch.object(cv, "_read_hook_json", return_value=payload),
             mock.patch.object(cv, "load_config", return_value=cv.default_config()),
+            mock.patch.object(cv, "voice_rule", return_value={"enabled": enabled}),
             mock.patch.object(cv, "_daemon_alive", return_value=alive),
             mock.patch.object(cv, "_spawn_daemon") as spawn,
             mock.patch.object(cv, "_resolve_tty", return_value="/dev/pts/9"),
@@ -22,7 +23,12 @@ class ClaimHookTests(unittest.TestCase):
 
     def test_prompt_claims_and_asks_to_pause_same_terminal(self):
         sent, _ = self.run_claim({"prompt": "next question"})
-        self.assertEqual(sent, [{"op": "claim", "tty_path": "/dev/pts/9", "pause": "same"}])
+        self.assertEqual(sent, [{"op": "claim", "tty_path": "/dev/pts/9", "claim": True,
+                                 "pause": "same"}])
+
+    def test_silent_session_pauses_but_does_not_claim(self):
+        sent, _ = self.run_claim({"prompt": "hi"}, enabled=False)
+        self.assertEqual(sent[0]["claim"], False)
 
     def test_voice_command_does_not_pause(self):
         sent, _ = self.run_claim({"prompt": "/voice resume"})

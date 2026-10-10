@@ -96,6 +96,8 @@ PID_PATH = os.path.join(RUNTIME_DIR, "daemon.pid")
 LOG_PATH = os.path.join(RUNTIME_DIR, "daemon.log")
 HISTORY_PATH = os.path.join(RUNTIME_DIR, "history.jsonl")
 HISTORY_MAX_ENTRIES = 200
+SESSIONS_PATH = os.path.join(RUNTIME_DIR, "sessions.json")
+SESSION_TTL = 7 * 86400               # forget per-session overrides after a week
 DAEMON_IDLE_TIMEOUT = 1800            # seconds before idle daemon exits
 DAEMON_SPAWN_WAIT = 15                # max seconds to wait for cold-spawned daemon
 ACTIVE_TTY_STALE = 600                # claim auto-expires after 10 min
@@ -342,6 +344,11 @@ def default_config() -> dict:
         # Karaoke rendering into the Claude Code terminal. Off by default: the
         # hook writes from outside Claude Code's TUI and corrupts its display.
         "hook_karaoke": False,
+        # Whether a Claude Code session speaks when no project or session rule
+        # matches it. Project rules key on a directory path (longest prefix
+        # wins) and may set "enabled", "voice" and "provider".
+        "default_enabled": True,
+        "projects": {},
         # Pause speech when a prompt is submitted: "same" = only speech from
         # that prompt's terminal, "any" = any session, "off" = never.
         "pause_on_prompt": "same",
@@ -1437,6 +1444,57 @@ def _ancestor_tty() -> str | None:
     return None
 
 
+# ── per-session / per-project rules ──
+
+def _load_sessions() -> dict:
+    try:
+        with open(SESSIONS_PATH) as f:
+            sessions = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    now = time.time()
+    return {k: v for k, v in sessions.items()
+            if isinstance(v, dict) and now - v.get("t", 0) < SESSION_TTL}
+
+
+def _save_sessions(sessions: dict) -> None:
+    os.makedirs(RUNTIME_DIR, mode=0o700, exist_ok=True)
+    tmp = SESSIONS_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(sessions, f, indent=2)
+    os.replace(tmp, SESSIONS_PATH)
+
+
+def _project_key(cwd: str | None) -> str:
+    return os.path.realpath(os.path.expanduser(cwd or os.getcwd()))
+
+
+def voice_rule(cfg: dict, session_id: str | None = None, cwd: str | None = None) -> dict:
+    """Effective {enabled, voice, provider, source} for one Claude Code session.
+
+    Precedence: session override > project rule (longest matching directory)
+    > "default_enabled". voice/provider None means the global setting.
+    """
+    rule = {"enabled": cfg.get("default_enabled", True), "voice": None,
+            "provider": None, "source": "default"}
+    cwd = _project_key(cwd)
+    best = ""
+    for path, project in (cfg.get("projects") or {}).items():
+        root = _project_key(path)
+        if (cwd == root or cwd.startswith(root.rstrip("/") + "/")) and len(root) > len(best):
+            best = root
+            match = project
+    if best:
+        rule.update({k: v for k, v in match.items() if k in ("enabled", "voice", "provider")})
+        rule["source"] = f"project {best}"
+    if session_id:
+        override = _load_sessions().get(session_id)
+        if override:
+            rule.update({k: v for k, v in override.items() if k in ("enabled", "voice", "provider")})
+            rule["source"] = "this session"
+    return rule
+
+
 def _read_hook_json() -> dict:
     """Parse hook stdin JSON; {} when run by hand from a terminal."""
     try:
@@ -1558,8 +1616,11 @@ def _handle_client(conn: socket.socket) -> None:
             same = req.get("tty_path") == _speaking_tty
             paused = (mode == "any" or (mode == "same" and same)) \
                 and _player is not None and _player.pause()
-            _active_tty = req.get("tty_path") or _active_tty
-            _active_tty_t = time.monotonic()
+            # A session that doesn't speak still pauses its own speech but
+            # doesn't take the voice away from one that does.
+            if req.get("claim", True):
+                _active_tty = req.get("tty_path") or _active_tty
+                _active_tty_t = time.monotonic()
             _daemon_log(f"claim: {_active_tty}" + (" (paused speech)" if paused else ""))
             conn.sendall(json.dumps({"ok": True, "active_tty": _active_tty,
                                      "paused": paused}).encode() + b"\n")
@@ -1805,7 +1866,7 @@ def _invoker() -> str:
 
 
 SLASH_TEMPLATE = """---
-description: "Control voice output: stop, pause, resume, on, off, mute, status, provider <name>, voice <name>, speed <x>, volume <x>, theme <name>, history on|off, voices"
+description: "Control voice output: stop, pause, resume, session|project on|off|voice <name>, default on|off, on, off, mute, status, provider <name>, voice <name>, speed <x>, volume <x>, theme <name>, history on|off, voices"
 allowed-tools: "Bash({invoker} slash:*)"
 ---
 
@@ -2154,7 +2215,7 @@ def cmd_key(args):
 # ── per-terminal routing commands ──
 
 def cmd_claim(args=None) -> None:
-    """UserPromptSubmit hook: claim this terminal and pause its speech.
+    """UserPromptSubmit hook: claim this terminal and pause current speech.
 
     If no daemon is running, spawn one without waiting so the model loads
     while Claude works on the reply instead of after it.
@@ -2163,11 +2224,13 @@ def cmd_claim(args=None) -> None:
     cfg = load_config()
     if (data.get("prompt") or "").lstrip().startswith("/voice"):
         return  # /voice runs its own playback command; don't pause under it
+    enabled = cfg.get("enabled", True) and voice_rule(
+        cfg, data.get("session_id"), data.get("cwd"))["enabled"]
     if not _daemon_alive():
-        if cfg.get("enabled", True) and cfg.get("use_daemon", True):
+        if enabled and cfg.get("use_daemon", True):
             _spawn_daemon()
         return
-    _send_to_daemon({"op": "claim", "tty_path": _resolve_tty(),
+    _send_to_daemon({"op": "claim", "tty_path": _resolve_tty(), "claim": enabled,
                      "pause": cfg.get("pause_on_prompt", "same")}, timeout=1.0)
 
 
@@ -2501,8 +2564,51 @@ def cmd_slash(args):
                 f"· volume: {int(cfg.get('volume', 1.0) * 100)}% · theme: {cfg.get('theme', 'aurora')} "
                 f"· history: {'ON' if cfg.get('history_enabled', False) else 'OFF'}")
 
+    session_id = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    project_dir = _project_key(os.environ.get("CLAUDE_PROJECT_DIR"))
+
+    def rule_status() -> str:
+        rule = voice_rule(cfg, session_id, project_dir)
+        provider = rule["provider"] or cfg.get("provider", "kokoro")
+        voice = rule["voice"] or current_voice(cfg, provider)
+        return (f"this session: {'SPEAKS' if rule['enabled'] else 'SILENT'} · {provider}/{voice} "
+                f"(from {rule['source']})")
+
+    def set_rule(scope: str, rest: list[str]) -> str:
+        if not rest:
+            return rule_status()
+        verb = rest[0].lower()
+        if scope == "session":
+            if not session_id:
+                return "error: CLAUDE_CODE_SESSION_ID not set; run /voice inside Claude Code"
+            sessions = _load_sessions()
+            entry = sessions.setdefault(session_id, {})
+        else:
+            entry = cfg.setdefault("projects", {}).setdefault(project_dir, {})
+        if verb in ("on", "off"):
+            entry["enabled"] = verb == "on"
+        elif verb == "voice" and len(rest) > 1:
+            entry["voice"] = rest[1]
+        elif verb == "provider" and len(rest) > 1:
+            entry["provider"] = resolve_provider(rest[1])
+        elif verb in ("clear", "reset"):
+            entry.clear()
+        else:
+            return f"usage: /voice {scope} on|off|voice <name>|provider <name>|clear"
+        if scope == "session":
+            if entry:
+                entry["t"] = time.time()
+            else:
+                sessions.pop(session_id, None)
+            _save_sessions(sessions)
+        else:
+            if not entry:
+                cfg["projects"].pop(project_dir, None)
+            save_config(cfg)
+        return f"{scope} rule updated — {rule_status()}"
+
     if not args or args[0] in ("status", "state"):
-        print(plain_status())
+        print(f"{plain_status()}\n{rule_status()}")
         return
     action, rest = args[0].lower(), args[1:]
     try:
@@ -2558,6 +2664,13 @@ def cmd_slash(args):
                 resp = _send_to_daemon({"op": action}, timeout=1.5) or {}
                 done = {"stop": "stopped", "pause": "paused", "resume": "resumed"}[action]
                 print(resp.get("error") or done)
+        elif action in ("session", "project"):
+            print(set_rule(action, rest))
+        elif action == "default" and rest and rest[0].lower() in ("on", "off"):
+            cfg["default_enabled"] = rest[0].lower() == "on"
+            save_config(cfg)
+            print(f"sessions without a rule now {'SPEAK' if cfg['default_enabled'] else 'stay SILENT'}"
+                  f" — {rule_status()}")
         elif action == "voices":
             target = cfg.get("provider", "kokoro")
             names = {"kokoro": list(KOKORO_VOICES), "openai": list(OPENAI_VOICES),
@@ -2567,7 +2680,9 @@ def cmd_slash(args):
         elif action == "providers":
             print("providers: " + ", ".join(f"{p} ({PROVIDERS[p]['blurb']})" for p in PROVIDERS))
         else:
-            print("usage: /voice [on|off|toggle|mute|unmute|status|stop|pause|resume|provider <name>|voice <name>|"
+            print("usage: /voice [on|off|toggle|mute|unmute|status|stop|pause|resume|"
+                  "session on|off|voice <v>|clear|project on|off|voice <v>|clear|default on|off|"
+                  "provider <name>|voice <name>|"
                   "speed <x>|volume <x>|theme <name>|announce on|off|history on|off|voices|providers]")
     except (ProviderError, ValueError) as e:
         print(f"error: {e}")
@@ -2650,6 +2765,7 @@ def main():
 
     text = None
     hook_mode = False
+    voice = args.voice
     if args.text:
         text = " ".join(args.text)
     elif not sys.stdin.isatty():
@@ -2657,6 +2773,17 @@ def main():
         if not cfg.get("enabled", True):
             sys.exit(0)
         raw = sys.stdin.read().strip()
+        try:
+            hook = json.loads(raw)
+        except json.JSONDecodeError:
+            hook = None
+        if isinstance(hook, dict):
+            rule = voice_rule(cfg, hook.get("session_id"), hook.get("cwd"))
+            if not rule["enabled"]:
+                sys.exit(0)
+            if rule["provider"] and not provider:
+                provider = resolve_provider(rule["provider"])
+            voice = voice or rule["voice"]
         text = extract_hook_text(raw)
         if text and is_mostly_code(text):
             sys.exit(0)
@@ -2690,7 +2817,7 @@ def main():
             "op": "speak",
             "text": text,
             "provider": provider or cfg.get("provider", "kokoro"),
-            "voice": args.voice,
+            "voice": voice,
             "tty_path": tty_path,
             "render": render,
         }, timeout=5.0)
@@ -2702,7 +2829,7 @@ def main():
         # Daemon reachable but request errored — fall through to in-process.
 
     try:
-        speak_and_highlight(text, provider=provider, voice=args.voice, tty_path=tty_path,
+        speak_and_highlight(text, provider=provider, voice=voice, tty_path=tty_path,
                             render=render)
     except Exception as e:
         if _tty:
