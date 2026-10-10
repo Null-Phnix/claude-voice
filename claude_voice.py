@@ -342,6 +342,9 @@ def default_config() -> dict:
         "elevenlabs_model": "eleven_turbo_v2_5",
         "grok_language": "en",
         "custom": {"base_url": "", "model": "tts-1"},
+        # Karaoke rendering into the Claude Code terminal. Off by default: the
+        # hook writes from outside Claude Code's TUI and corrupts its display.
+        "hook_karaoke": False,
     }
 
 
@@ -1051,7 +1054,7 @@ def _read_history() -> list[dict]:
 
 def speak_and_highlight(text: str, provider: str | None = None, voice: str | None = None,
                         show_stats: bool = False, tty_path: str = "/dev/tty",
-                        record_history: bool = True) -> dict:
+                        record_history: bool = True, render: bool = True) -> dict:
     global _interrupted, _play_audio, _play_rate, _play_duration, \
         _play_offset, _play_t0, _play_paused
     cfg = load_config()
@@ -1067,7 +1070,9 @@ def speak_and_highlight(text: str, provider: str | None = None, voice: str | Non
     all_words = text.split()
     total_words = len(all_words)
 
-    out = get_tty(tty_path)
+    # render=False: play audio only. No karaoke, and no keypress listener
+    # putting someone else's terminal into raw mode.
+    out = get_tty(tty_path) if render else open(os.devnull, "w")
     out.write(HIDE_CURSOR)
     spinner = Spinner(out, f"synthesizing · {provider} · {voice or 'default'}").start()
     try:
@@ -1096,7 +1101,8 @@ def speak_and_highlight(text: str, provider: str | None = None, voice: str | Non
     if chime:
         play_chime_start()
 
-    _start_keypress_listener(tty_path)
+    if render:
+        _start_keypress_listener(tty_path)
 
     width = term_width(out)
     out.write(f"{render_header(provider, voice, 0, audio_duration)}\n\n")
@@ -1232,6 +1238,11 @@ def _resolve_tty() -> str:
             return os.ttyname(fd)
         except OSError:
             continue
+    # Claude Code runs hooks without a controlling terminal, so /dev/tty
+    # fails there. Walk up to the Claude Code process and use its terminal.
+    tty_path = _ancestor_tty()
+    if tty_path:
+        return tty_path
     fd = None
     try:
         fd = os.open("/dev/tty", os.O_RDONLY)
@@ -1244,6 +1255,32 @@ def _resolve_tty() -> str:
                 os.close(fd)
             except OSError:
                 pass
+
+
+def _ancestor_tty() -> str | None:
+    """Linux: the terminal of $CLAUDE_PID, or of the nearest ancestor that has one."""
+    pids = []
+    if os.environ.get("CLAUDE_PID", "").isdigit():
+        pids.append(int(os.environ["CLAUDE_PID"]))
+    pid = os.getppid()
+    for _ in range(12):
+        if pid <= 1:
+            break
+        pids.append(pid)
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                pid = int(f.read().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            break
+    for pid in pids:
+        for fd in (0, 1, 2):
+            try:
+                target = os.readlink(f"/proc/{pid}/fd/{fd}")
+            except OSError:
+                continue
+            if re.match(r"/dev/(pts/\d+|tty\w+)$", target):
+                return target
+    return None
 
 
 def _daemon_alive() -> bool:
@@ -1476,6 +1513,7 @@ def _handle_client(conn: socket.socket) -> None:
         tty_path = req.get("tty_path") or "/dev/tty"
         override = bool(req.get("override"))
         record_history = bool(req.get("record_history", True))
+        render = bool(req.get("render", True))
 
         if not text.strip():
             conn.sendall(json.dumps({"error": "empty"}).encode() + b"\n")
@@ -1514,8 +1552,8 @@ def _handle_client(conn: socket.socket) -> None:
         with _playback_lock:
             _interrupted = False
             try:
-                speak_and_highlight(text, provider=provider, voice=voice,
-                                    tty_path=tty_path, record_history=record_history)
+                speak_and_highlight(text, provider=provider, voice=voice, tty_path=tty_path,
+                                    record_history=record_history, render=render)
             except Exception as e:
                 # The audio output device (e.g. Bluetooth headphones) likely
                 # changed under us — PortAudio holds a stale handle to it.
@@ -1526,8 +1564,8 @@ def _handle_client(conn: socket.socket) -> None:
                         sd._terminate()
                         sd._initialize()
                     _interrupted = False
-                    speak_and_highlight(text, provider=provider, voice=voice,
-                                        tty_path=tty_path, record_history=False)
+                    speak_and_highlight(text, provider=provider, voice=voice, tty_path=tty_path,
+                                        record_history=False, render=render)
                 except Exception as e2:
                     _daemon_log(f"retry failed: {e2}")
     except (json.JSONDecodeError, OSError, ValueError) as e:
@@ -2484,6 +2522,10 @@ def main():
 
     tty_path = _resolve_tty()
     use_daemon = cfg.get("use_daemon", True) and not args.no_daemon
+    # Draw karaoke (and grab keypresses) only on a terminal this process owns;
+    # a tty found by walking up to Claude Code belongs to its TUI.
+    owns_tty = any(os.isatty(fd) for fd in (0, 1, 2))
+    render = owns_tty if not hook_mode else cfg.get("hook_karaoke", False)
 
     if use_daemon and _ensure_daemon():
         resp = _send_to_daemon({
@@ -2492,6 +2534,7 @@ def main():
             "provider": provider or cfg.get("provider", "kokoro"),
             "voice": args.voice,
             "tty_path": tty_path,
+            "render": render,
         }, timeout=5.0)
         # "queued" → the daemon is speaking; "skipped" → it deliberately
         # declined (muted / another terminal owns the voice). Either way,
@@ -2501,7 +2544,8 @@ def main():
         # Daemon reachable but request errored — fall through to in-process.
 
     try:
-        speak_and_highlight(text, provider=provider, voice=args.voice, tty_path=tty_path)
+        speak_and_highlight(text, provider=provider, voice=args.voice, tty_path=tty_path,
+                            render=render)
     except Exception as e:
         if _tty:
             _tty.write(SHOW_CURSOR)
