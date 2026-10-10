@@ -113,7 +113,7 @@ class RoutingTests(unittest.TestCase):
 
     def test_claim_records_active_tty(self):
         resp = _send(self.sock_path, {"op": "claim", "tty_path": "/dev/ttysA"})
-        self.assertEqual(resp, {"ok": True, "active_tty": "/dev/ttysA"})
+        self.assertEqual(resp, {"ok": True, "active_tty": "/dev/ttysA", "paused": False})
         status = _send(self.sock_path, {"op": "status"})
         self.assertEqual(status.get("active_tty"), "/dev/ttysA")
 

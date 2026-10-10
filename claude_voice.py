@@ -81,7 +81,7 @@ VERSION = "0.3.0"
 SAMPLE_RATE = 24000
 WINDOW = 8
 MIN_CHARS = 30
-MAX_CHARS = 1500
+MAX_CHARS = 8000
 DONE_PAUSE = 0.5
 CONFIG_PATH = os.path.expanduser("~/.config/claude-voice/config.json")
 ELEVEN_CACHE_PATH = os.path.expanduser("~/.config/claude-voice/elevenlabs_voices.json")
@@ -276,13 +276,10 @@ _active_tty: str | None = None
 _active_tty_t: float = 0.0
 _muted_ttys: set[str] = set()
 
-# Last synthesized audio, kept in-process so the daemon can seek within it.
-_play_audio = None
-_play_rate = SAMPLE_RATE
-_play_duration = 0.0
-_play_offset = 0.0
-_play_t0 = 0.0
-_play_paused = False
+# Current or most recent Player, kept so the daemon can pause, resume and
+# seek within the last message.
+_player = None
+_speaking_tty: str | None = None
 
 
 class ProviderError(Exception):
@@ -345,6 +342,9 @@ def default_config() -> dict:
         # Karaoke rendering into the Claude Code terminal. Off by default: the
         # hook writes from outside Claude Code's TUI and corrupts its display.
         "hook_karaoke": False,
+        # Pause speech when a prompt is submitted: "same" = only speech from
+        # that prompt's terminal, "any" = any session, "off" = never.
+        "pause_on_prompt": "same",
     }
 
 
@@ -429,6 +429,8 @@ def _clear_ui(t):
 def _handle_signal(sig, frame):
     global _interrupted
     _interrupted = True
+    if _player is not None:
+        _player.stop()
     if sd is not None:
         sd.stop()
     _restore_terminal()
@@ -559,6 +561,125 @@ def play_chime_start():
 
 def play_chime_end():
     _chime(900, 600, 0.12)
+
+
+# ── streaming playback ──
+
+class Player:
+    """Plays a buffer that keeps growing while synthesis runs.
+
+    Playback starts as soon as the first sentence is appended instead of after
+    the whole message. Pause, resume, seek and stop all move one sample cursor
+    that the audio callback reads, so they work mid-synthesis too.
+    """
+
+    def __init__(self, rate: int = SAMPLE_RATE):
+        self.rate = rate
+        self.paused = False
+        self.stopped = False
+        self.drained = threading.Event()
+        self._buf = np.zeros(0, dtype=np.float32)
+        self._pos = 0
+        self._input_done = False
+        self._stream = None
+        self._lock = threading.Lock()
+
+    @property
+    def position(self) -> float:
+        return self._pos / self.rate
+
+    @property
+    def duration(self) -> float:
+        return len(self._buf) / self.rate
+
+    @property
+    def active(self) -> bool:
+        return self._stream is not None and not self.paused and not self.stopped
+
+    def append(self, audio, rate: int | None = None) -> None:
+        audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+        with self._lock:
+            if rate and not len(self._buf):
+                self.rate = rate
+            self._buf = np.concatenate([self._buf, audio])
+        if not self.stopped:
+            self._ensure_stream()
+
+    def finish_input(self) -> None:
+        with self._lock:
+            self._input_done = True
+            if self._pos >= len(self._buf):
+                self.drained.set()
+
+    def pause(self) -> bool:
+        with self._lock:
+            if self.stopped or self.drained.is_set():
+                return False
+            self.paused = True
+            return True
+
+    def resume(self) -> None:
+        """Continue from the cursor; restart from the top if it already finished."""
+        with self._lock:
+            if self.drained.is_set():
+                self._pos = 0
+                self.drained.clear()
+            self.paused = False
+            self.stopped = False
+        self._ensure_stream()
+
+    def seek(self, seconds: float) -> float:
+        with self._lock:
+            self._pos = int(max(0.0, min(seconds, self.duration)) * self.rate)
+            self.drained.clear()
+            self.paused = False
+            self.stopped = False
+        self._ensure_stream()
+        return self.position
+
+    def stop(self) -> None:
+        with self._lock:
+            self.stopped = True
+
+    def _callback(self, outdata, frames, time_info, status):
+        with self._lock:
+            outdata.fill(0)
+            if self.paused or self.stopped:
+                return
+            chunk = self._buf[self._pos:self._pos + frames]
+            outdata[:len(chunk), 0] = chunk
+            self._pos += len(chunk)
+            if self._input_done and self._pos >= len(self._buf):
+                self.drained.set()
+
+    def _ensure_stream(self) -> None:
+        with self._lock:
+            if self._stream is not None:
+                return
+            stream = sd.OutputStream(samplerate=self.rate, channels=1, dtype="float32",
+                                     callback=self._callback)
+            self._stream = stream
+        stream.start()
+        threading.Thread(target=self._close_when_done, args=(stream,), daemon=True).start()
+
+    def _close_when_done(self, stream) -> None:
+        # Paused streams stay open (emitting silence) so resume is instant.
+        while True:
+            time.sleep(0.05)
+            with self._lock:
+                if self.stopped or self.drained.is_set():
+                    if self._stream is stream:
+                        self._stream = None
+                    stopped = self.stopped
+                    break
+        try:
+            if stopped:
+                stream.abort()
+            else:
+                stream.stop()  # lets queued buffers play out
+            stream.close()
+        except Exception:
+            pass
 
 
 # ── text processing ──
@@ -716,30 +837,27 @@ def get_pipe():
     return _pipe
 
 
-def synth_kokoro(text: str, voice: str, speed: float, cfg: dict):
+def kokoro_sentences(text: str, voice: str, speed: float, cfg: dict):
+    """Yield (audio, display_words, timings) one sentence at a time."""
     pipe = get_pipe()
-
-    parts, timings = [], []
-    offset = 0
     # Split once: substitutions such as "vs." -> "versus" remove punctuation,
     # so splitting the spoken text again can detach timings from display words.
     for display_sentence in split_sentences(text):
         sentence = fix_pronunciation(display_sentence)
-        chunks = []
-        for result in pipe(sentence, voice=voice, speed=speed):
-            chunks.append(result.audio.numpy())
+        chunks = [result.audio.numpy() for result in pipe(sentence, voice=voice, speed=speed)]
         words = display_sentence.split()
-        if chunks:
-            audio = np.concatenate(chunks)
-            seg_dur = len(audio) / SAMPLE_RATE
-            seg_start = offset / SAMPLE_RATE
-            for ws, we in estimate_word_timings(words, seg_dur):
-                timings.append((seg_start + ws, seg_start + we))
+        audio = np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.float32)
+        yield audio, words, estimate_word_timings(words, len(audio) / SAMPLE_RATE)
+
+
+def synth_kokoro(text: str, voice: str, speed: float, cfg: dict):
+    parts, timings = [], []
+    offset = 0.0
+    for audio, _, sentence_timings in kokoro_sentences(text, voice, speed, cfg):
+        timings.extend((offset + ws, offset + we) for ws, we in sentence_timings)
+        if len(audio):
             parts.append(audio)
-            offset += len(audio)
-        else:
-            seg_start = offset / SAMPLE_RATE
-            timings.extend([(seg_start, seg_start)] * len(words))
+            offset += len(audio) / SAMPLE_RATE
     if not parts:
         raise ProviderError("kokoro produced no audio")
     return np.concatenate(parts), SAMPLE_RATE, timings
@@ -1052,11 +1170,32 @@ def _read_history() -> list[dict]:
     return entries
 
 
+def _synth_pieces(provider: str, text: str, voice: str, speed: float, cfg: dict):
+    """Yield (audio, rate, display_words, timings) as each piece is ready.
+
+    Kokoro yields per sentence so playback can start after the first one;
+    cloud providers return the whole message from one request.
+    """
+    if provider == "kokoro":
+        volume = float(cfg.get("volume", 1.0))
+        for audio, words, timings in kokoro_sentences(text, voice, speed, cfg):
+            if volume != 1.0:
+                audio = np.clip(audio * volume, -1.0, 1.0)
+            yield audio, SAMPLE_RATE, words, timings
+        return
+    audio, rate, timings = synthesize(provider, text, voice, speed, cfg)
+    words = text.split()
+    if timings:
+        timings = remap_timings(timings, len(words))
+    if not timings or len(timings) != len(words):
+        timings = estimate_word_timings(words, len(audio) / rate)
+    yield audio, rate, words, timings
+
+
 def speak_and_highlight(text: str, provider: str | None = None, voice: str | None = None,
                         show_stats: bool = False, tty_path: str = "/dev/tty",
                         record_history: bool = True, render: bool = True) -> dict:
-    global _interrupted, _play_audio, _play_rate, _play_duration, \
-        _play_offset, _play_t0, _play_paused
+    global _interrupted, _player
     cfg = load_config()
     provider = provider or cfg.get("provider", "kokoro")
     voice = voice or current_voice(cfg, provider)
@@ -1064,105 +1203,120 @@ def speak_and_highlight(text: str, provider: str | None = None, voice: str | Non
     window = cfg.get("window", WINDOW)
     done_pause = cfg.get("done_pause", DONE_PAUSE)
     chime = cfg.get("chime", True)
+    _require_audio()
     _interrupted = False
 
     t0 = time.monotonic()
-    all_words = text.split()
-    total_words = len(all_words)
-
-    # render=False: play audio only. No karaoke, and no keypress listener
-    # putting someone else's terminal into raw mode.
-    out = get_tty(tty_path) if render else open(os.devnull, "w")
-    out.write(HIDE_CURSOR)
-    spinner = Spinner(out, f"synthesizing · {provider} · {voice or 'default'}").start()
-    try:
-        audio, rate, timings = synthesize(provider, text, voice, speed, cfg)
-    except Exception as e:
-        spinner.stop()
-        out.write(f"  {RED}✗{RESET} {LABEL}claude-voice ({provider}):{RESET} {e}\n")
-        out.write(SHOW_CURSOR)
-        out.flush()
-        sys.stderr.write(f"claude-voice: {provider}: {e}\n")
-        return {}
-    spinner.stop()
+    player = Player()
+    _player = player
+    words: list[str] = []
+    timings: list[tuple[float, float]] = []
+    state = {"error": None, "ttfa": None, "gen_time": None}
 
     if record_history and cfg.get("history_enabled", False):
         _log_history(text, provider, voice)
 
-    gen_time = time.monotonic() - t0
-    audio_duration = len(audio) / rate
-    _play_audio, _play_rate, _play_duration = audio, rate, audio_duration
+    def produce():
+        try:
+            for audio, rate, piece_words, piece_timings in _synth_pieces(
+                    provider, text, voice, speed, cfg):
+                if player.stopped:
+                    return
+                offset = player.duration
+                words.extend(piece_words)
+                timings.extend((offset + ws, offset + we) for ws, we in piece_timings)
+                if not len(audio):
+                    continue
+                first = state["ttfa"] is None
+                if first and chime:
+                    play_chime_start()
+                player.append(audio, rate)
+                if first:
+                    state["ttfa"] = time.monotonic() - t0
+        except Exception as e:
+            state["error"] = e
+            player.stop()
+        finally:
+            state["gen_time"] = time.monotonic() - t0
+            player.finish_input()
 
-    if timings:
-        timings = remap_timings(timings, total_words)
-    if not timings or len(timings) != total_words:
-        timings = estimate_word_timings(all_words, audio_duration)
-
-    if chime:
-        play_chime_start()
-
+    out = None
     if render:
+        out = get_tty(tty_path)
+        out.write(HIDE_CURSOR)
+        spinner = Spinner(out, f"synthesizing · {provider} · {voice or 'default'}").start()
         _start_keypress_listener(tty_path)
+    threading.Thread(target=produce, daemon=True).start()
 
-    width = term_width(out)
-    out.write(f"{render_header(provider, voice, 0, audio_duration)}\n\n")
-    out.flush()
-
-    ttfa = time.monotonic() - t0
-    playback_start = time.monotonic()
-    _play_offset, _play_t0, _play_paused = 0.0, playback_start, False
-    sd.play(audio, samplerate=rate)
-
-    for word_idx, (start, end) in enumerate(timings):
-        if _interrupted:
+    width = term_width(out) if out else 0
+    started = False
+    while not (player.stopped or _interrupted):
+        if player.drained.wait(0.05):
             break
-        elapsed = time.monotonic() - playback_start
-        if elapsed < start:
-            time.sleep(start - elapsed)
-        if _interrupted:
-            break
-        elapsed = time.monotonic() - playback_start
-        header = render_header(provider, voice, elapsed, audio_duration)
-        karaoke = render_karaoke(all_words, word_idx, window, width)
-        bar = mini_bar(word_idx + 1, total_words)
+        if out is None or state["ttfa"] is None:
+            continue
+        if not started:
+            spinner.stop()
+            out.write(f"{render_header(provider, voice, 0, player.duration)}\n\n")
+            started = True
+        pos = player.position
+        idx = max(0, sum(1 for ws, _ in timings if ws <= pos) - 1)
+        header = render_header(provider, voice, pos, player.duration)
+        karaoke = render_karaoke(words, idx, window, width)
+        bar = mini_bar(idx + 1, len(words))
         out.write(f"\r\033[2A\033[K{header}\n\033[K  {karaoke}\n\033[K  {bar}")
         out.flush()
 
-    # The last highlight marks a word's start, not the end of its audio.
-    # Explicit stop requests also unblock sounddevice's completion wait.
-    if not _interrupted:
-        sd.wait()
-    sd.stop()
-    _restore_terminal()
-    total_time = time.monotonic() - t0
+    if _interrupted:
+        player.stop()
+    finished = player.drained.is_set() and not player.stopped
+    if out is not None:
+        _restore_terminal()
+        if not started:
+            spinner.stop()
+    if state["error"] is not None and state["ttfa"] is None:
+        e = state["error"]
+        if out is not None:
+            out.write(f"  {RED}✗{RESET} {LABEL}claude-voice ({provider}):{RESET} {e}\n{SHOW_CURSOR}")
+            out.flush()
+        sys.stderr.write(f"claude-voice: {provider}: {e}\n")
+        if not isinstance(e, ProviderError):
+            raise e  # audio device trouble: let the daemon reinitialize and retry
+        return {}
 
-    if not _interrupted:
-        header = render_header(provider, voice, audio_duration, audio_duration)
-        bar = mini_bar(total_words, total_words)
-        out.write(f"\r\033[2A\033[K{header}\n\033[K  {SPOKEN}done{RESET}\n\033[K  {bar}")
-        out.flush()
-        time.sleep(done_pause)
+    if finished:
+        if started:
+            header = render_header(provider, voice, player.duration, player.duration)
+            bar = mini_bar(len(words), len(words))
+            out.write(f"\r\033[2A\033[K{header}\n\033[K  {SPOKEN}done{RESET}\n\033[K  {bar}")
+            out.flush()
+            time.sleep(done_pause)
         if chime:
             play_chime_end()
-
-    _clear_ui(out)
+    if started:
+        _clear_ui(out)
+    elif out is not None:
+        out.write(SHOW_CURSOR)
+        out.flush()
 
     stats = {
-        "ttfa": ttfa,
-        "gen_time": gen_time,
-        "audio_duration": audio_duration,
-        "total_time": total_time,
-        "words": total_words,
+        "ttfa": state["ttfa"] or 0.0,
+        "gen_time": state["gen_time"] or 0.0,
+        "audio_duration": player.duration,
+        "total_time": time.monotonic() - t0,
+        "words": len(words),
         "chars": len(text),
         "voice": voice,
         "provider": provider,
+        "finished": finished,
     }
     if not show_stats:
         sys.stderr.write(
-            f"claude-voice: ttfa={ttfa:.2f}s gen={gen_time:.2f}s "
-            f"total={total_time:.2f}s words={total_words} provider={provider} voice={voice}\n"
+            f"claude-voice: ttfa={stats['ttfa']:.2f}s gen={stats['gen_time']:.2f}s "
+            f"total={stats['total_time']:.2f}s words={len(words)} provider={provider} "
+            f"voice={voice} {'done' if finished else 'stopped'}\n"
         )
-    if out is not sys.stderr:
+    if out is not None and out is not sys.stderr:
         out.close()
     return stats
 
@@ -1283,6 +1437,17 @@ def _ancestor_tty() -> str | None:
     return None
 
 
+def _read_hook_json() -> dict:
+    """Parse hook stdin JSON; {} when run by hand from a terminal."""
+    try:
+        if sys.stdin is None or sys.stdin.isatty():
+            return {}
+        data = json.loads(sys.stdin.read() or "{}")
+        return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError, ValueError):
+        return {}
+
+
 def _daemon_alive() -> bool:
     """Return True if a daemon is reachable on the socket."""
     if not os.path.exists(SOCK_PATH):
@@ -1350,8 +1515,7 @@ def _ensure_daemon(wait_seconds: int = DAEMON_SPAWN_WAIT) -> bool:
 
 def _handle_client(conn: socket.socket) -> None:
     """One connection's lifecycle. Runs on a daemon worker thread."""
-    global _daemon_idle_t0, _interrupted, _active_tty, _active_tty_t, \
-        _play_offset, _play_t0, _play_paused
+    global _daemon_idle_t0, _interrupted, _active_tty, _active_tty_t, _speaking_tty
     try:
         conn.settimeout(2.0)
         buf = b""
@@ -1381,17 +1545,24 @@ def _handle_client(conn: socket.socket) -> None:
         if op == "stop":
             # Interrupt current playback (hotkey "shut up" button).
             _interrupted = True
-            if sd is not None:
-                sd.stop()
+            if _player is not None:
+                _player.stop()
             _daemon_log("stop requested")
             conn.sendall(json.dumps({"ok": True}).encode() + b"\n")
             return
 
         if op == "claim":
+            # Sent on every prompt submit; pauses speech per "pause_on_prompt".
+            mode = req.get("pause")
+            mode = "any" if mode is True else (mode or "off")
+            same = req.get("tty_path") == _speaking_tty
+            paused = (mode == "any" or (mode == "same" and same)) \
+                and _player is not None and _player.pause()
             _active_tty = req.get("tty_path") or _active_tty
             _active_tty_t = time.monotonic()
-            _daemon_log(f"claim: {_active_tty}")
-            conn.sendall(json.dumps({"ok": True, "active_tty": _active_tty}).encode() + b"\n")
+            _daemon_log(f"claim: {_active_tty}" + (" (paused speech)" if paused else ""))
+            conn.sendall(json.dumps({"ok": True, "active_tty": _active_tty,
+                                     "paused": paused}).encode() + b"\n")
             return
 
         if op == "unclaim":
@@ -1432,75 +1603,37 @@ def _handle_client(conn: socket.socket) -> None:
             }).encode() + b"\n")
             return
 
-        if op == "seek":
-            # Jump within the last synthesized message (audio only, no karaoke).
-            if _play_audio is None:
-                conn.sendall(json.dumps({"error": "nothing to seek"}).encode() + b"\n")
+        if op in ("seek", "playpause", "pause", "resume"):
+            # Act on the current or most recent message (audio only when no
+            # speak call is driving it, e.g. resuming a finished message).
+            if _player is None:
+                err = "nothing to seek" if op == "seek" else "nothing to play"
+                conn.sendall(json.dumps({"error": err}).encode() + b"\n")
                 return
-            pos = float(req.get("pos", 0.0))
-            if not math.isfinite(pos):
-                raise ValueError("seek position must be finite")
-            pos = max(0.0, min(pos, _play_duration))
-            _interrupted = True
-            if sd is not None:
-                sd.stop()
-            with _playback_lock:
-                sd.play(_play_audio[int(pos * _play_rate):], samplerate=_play_rate)
-                _play_offset = pos
-                _play_t0 = time.monotonic()
-            _play_paused = False
-            _daemon_log(f"seek: {pos:.1f}s / {_play_duration:.1f}s")
-            conn.sendall(json.dumps({"ok": True, "pos": pos}).encode() + b"\n")
-            return
-
-        if op == "playpause":
-            if _play_audio is None:
-                conn.sendall(json.dumps({"error": "nothing to play"}).encode() + b"\n")
-                return
-            active = False
-            try:
-                active = bool(sd.get_stream().active)
-            except Exception:
-                pass
-            if active and not _play_paused:
-                # pause: remember where we are, stop the stream
-                pos = min(_play_offset + time.monotonic() - _play_t0, _play_duration)
-                _interrupted = True
-                sd.stop()
-                _play_offset = pos
-                _play_paused = True
-                _daemon_log(f"pause at {pos:.1f}s")
+            if op == "seek":
+                pos = float(req.get("pos", 0.0))
+                if not math.isfinite(pos):
+                    raise ValueError("seek position must be finite")
+                _player.seek(pos)
+            elif op == "pause" or (op == "playpause" and _player.active):
+                _player.pause()
             else:
-                # resume from the paused position (or restart if finished)
-                pos = _play_offset
-                if pos >= _play_duration - 0.05:
-                    pos = 0.0
-                _interrupted = True
-                sd.stop()
-                with _playback_lock:
-                    sd.play(_play_audio[int(pos * _play_rate):], samplerate=_play_rate)
-                    _play_offset = pos
-                    _play_t0 = time.monotonic()
-                _play_paused = False
-                _daemon_log(f"resume at {pos:.1f}s")
-            conn.sendall(json.dumps({"ok": True, "paused": _play_paused,
-                                     "pos": _play_offset}).encode() + b"\n")
+                _player.resume()
+            _daemon_log(f"{op}: {_player.position:.1f}s / {_player.duration:.1f}s"
+                        + (" paused" if _player.paused else ""))
+            conn.sendall(json.dumps({"ok": True, "paused": _player.paused,
+                                     "pos": _player.position}).encode() + b"\n")
             return
 
         if op == "playinfo":
-            playing = False
-            pos = 0.0
-            if _play_audio is not None:
-                if _play_paused:
-                    pos = _play_offset
-                else:
-                    pos = min(_play_offset + time.monotonic() - _play_t0, _play_duration)
-                try:
-                    playing = bool(sd.get_stream().active) and not _play_paused
-                except Exception:
-                    playing = False
-            conn.sendall(json.dumps({"ok": True, "pos": pos, "duration": _play_duration,
-                                     "playing": playing, "paused": _play_paused}).encode() + b"\n")
+            p = _player
+            conn.sendall(json.dumps({
+                "ok": True,
+                "pos": p.position if p else 0.0,
+                "duration": p.duration if p else 0.0,
+                "playing": bool(p and p.active),
+                "paused": bool(p and p.paused),
+            }).encode() + b"\n")
             return
 
         # op == "speak"
@@ -1544,13 +1677,14 @@ def _handle_client(conn: socket.socket) -> None:
         except OSError:
             pass
 
-        # Preempt any in-progress playback
-        _interrupted = True
-        if sd is not None:
-            sd.stop()
+        # Preempt any in-progress (or paused) playback
+        if _player is not None:
+            _player.stop()
 
         with _playback_lock:
             _interrupted = False
+            _speaking_tty = tty_path
+            _daemon_log(f"speak: {tty_path} · {len(text)} chars · {provider}/{voice}")
             try:
                 speak_and_highlight(text, provider=provider, voice=voice, tty_path=tty_path,
                                     record_history=record_history, render=render)
@@ -1588,6 +1722,15 @@ def cmd_daemon(args=None) -> None:
     if _daemon_alive():
         _daemon_log("daemon already running, exiting")
         return
+    # Two hooks can spawn daemons at once; the socket isn't bound until the
+    # model loads, so only the lock keeps the second from unlinking the first.
+    lock = open(SOCK_PATH + ".lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        _daemon_log("another daemon is starting, exiting")
+        return
+
 
     # Stale socket cleanup — a prior daemon that crashed without unlinking.
     try:
@@ -1662,7 +1805,7 @@ def _invoker() -> str:
 
 
 SLASH_TEMPLATE = """---
-description: "Control voice output: on, off, mute, status, provider <name>, voice <name>, speed <x>, volume <x>, theme <name>, history on|off, voices"
+description: "Control voice output: stop, pause, resume, on, off, mute, status, provider <name>, voice <name>, speed <x>, volume <x>, theme <name>, history on|off, voices"
 allowed-tools: "Bash({invoker} slash:*)"
 ---
 
@@ -2011,15 +2154,21 @@ def cmd_key(args):
 # ── per-terminal routing commands ──
 
 def cmd_claim(args=None) -> None:
-    """Mark the current terminal as the voice owner.
+    """UserPromptSubmit hook: claim this terminal and pause its speech.
 
-    Fire-and-forget: if no daemon is running, do nothing rather than blocking
-    the UserPromptSubmit hook for a cold spawn. The next speak request will
-    spawn the daemon, and the following prompt will re-claim.
+    If no daemon is running, spawn one without waiting so the model loads
+    while Claude works on the reply instead of after it.
     """
+    data = _read_hook_json()
+    cfg = load_config()
+    if (data.get("prompt") or "").lstrip().startswith("/voice"):
+        return  # /voice runs its own playback command; don't pause under it
     if not _daemon_alive():
+        if cfg.get("enabled", True) and cfg.get("use_daemon", True):
+            _spawn_daemon()
         return
-    _send_to_daemon({"op": "claim", "tty_path": _resolve_tty()}, timeout=1.0)
+    _send_to_daemon({"op": "claim", "tty_path": _resolve_tty(),
+                     "pause": cfg.get("pause_on_prompt", "same")}, timeout=1.0)
 
 
 def cmd_unclaim(args=None) -> None:
@@ -2402,6 +2551,13 @@ def cmd_slash(args):
             cfg["history_enabled"] = rest[0].lower() == "on"
             save_config(cfg)
             print(f"private response history set to {rest[0].lower()}")
+        elif action in ("stop", "pause", "resume"):
+            if not _daemon_alive():
+                print("nothing is playing")
+            else:
+                resp = _send_to_daemon({"op": action}, timeout=1.5) or {}
+                done = {"stop": "stopped", "pause": "paused", "resume": "resumed"}[action]
+                print(resp.get("error") or done)
         elif action == "voices":
             target = cfg.get("provider", "kokoro")
             names = {"kokoro": list(KOKORO_VOICES), "openai": list(OPENAI_VOICES),
@@ -2411,7 +2567,7 @@ def cmd_slash(args):
         elif action == "providers":
             print("providers: " + ", ".join(f"{p} ({PROVIDERS[p]['blurb']})" for p in PROVIDERS))
         else:
-            print("usage: /voice [on|off|toggle|mute|unmute|status|provider <name>|voice <name>|"
+            print("usage: /voice [on|off|toggle|mute|unmute|status|stop|pause|resume|provider <name>|voice <name>|"
                   "speed <x>|volume <x>|theme <name>|announce on|off|history on|off|voices|providers]")
     except (ProviderError, ValueError) as e:
         print(f"error: {e}")
@@ -2435,6 +2591,8 @@ COMMANDS = {
     "replay": cmd_replay,
     "seek": cmd_seek,
     "playpause": cmd_playpause,
+    "pause": lambda a: _send_to_daemon({"op": "pause"}, timeout=1.0) if _daemon_alive() else None,
+    "resume": lambda a: _send_to_daemon({"op": "resume"}, timeout=1.0) if _daemon_alive() else None,
     "playinfo": cmd_playinfo,
     "daemon": cmd_daemon,
     "daemon-status": cmd_daemon_status,

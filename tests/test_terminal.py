@@ -1,6 +1,7 @@
 """Hooks run without a controlling terminal; find Claude Code's instead."""
 
 import os
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -40,22 +41,27 @@ class AncestorTtyTests(unittest.TestCase):
 
 class RenderSwitchTests(unittest.TestCase):
     def test_render_false_never_touches_the_terminal(self):
+        from test_playback import FakeStream, fake_sd
+
+        FakeStream.instances = []
         cfg = dict(cv.default_config(), chime=False, done_pause=0)
-        audio = cv.np.zeros(cv.SAMPLE_RATE // 10, dtype=cv.np.float32)
-        device = mock.Mock()
+        samples = cv.np.zeros(cv.SAMPLE_RATE // 10, dtype=cv.np.float32)
+
+        def pipe(sentence, **kwargs):
+            yield SimpleNamespace(audio=SimpleNamespace(numpy=lambda: samples))
+
         with (
-            mock.patch.object(cv, "sd", device),
+            mock.patch.object(cv, "sd", fake_sd()),
             mock.patch.object(cv, "load_config", return_value=cfg),
-            mock.patch.object(cv, "synthesize", return_value=(audio, cv.SAMPLE_RATE, None)),
+            mock.patch.object(cv, "get_pipe", return_value=pipe),
             mock.patch.object(cv, "get_tty") as get_tty,
             mock.patch.object(cv, "_start_keypress_listener") as listener,
-            mock.patch.object(cv, "_restore_terminal"),
         ):
-            cv.speak_and_highlight("Hello there.", provider="kokoro",
-                                   record_history=False, render=False)
+            stats = cv.speak_and_highlight("Hello there.", provider="kokoro",
+                                           record_history=False, render=False)
         get_tty.assert_not_called()
         listener.assert_not_called()
-        device.play.assert_called_once()
+        self.assertTrue(stats["finished"])
 
 
 if __name__ == "__main__":
