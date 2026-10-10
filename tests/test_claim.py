@@ -42,7 +42,8 @@ class PauseModeTests(unittest.TestCase):
         conn.recv.side_effect = [
             (cv.json.dumps({"op": "claim", "tty_path": tty_path, "pause": mode}) + "\n").encode(), b""]
         with mock.patch.multiple(cv, _player=player, _speaking_tty="/dev/pts/1",
-                                 _active_tty=None, _active_tty_t=0.0):
+                                 _active_tty=None, _active_tty_t=0.0,
+                                 _daemon_log=mock.DEFAULT):
             cv._handle_client(conn)
         return player.pause.called
 
