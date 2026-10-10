@@ -342,6 +342,9 @@ def default_config() -> dict:
         "elevenlabs_model": "eleven_turbo_v2_5",
         "grok_language": "en",
         "custom": {"base_url": "", "model": "tts-1"},
+        # Extra term -> spoken form entries, merged over the built-in PRONOUNCE
+        # table. Values may be plain respellings or Kokoro "[term](/IPA/)".
+        "pronunciations": {},
     }
 
 
@@ -566,26 +569,167 @@ def is_mostly_code(text: str) -> bool:
     return len(text) > 0 and (code_chars / len(text)) > 0.5
 
 
+def _speak_inline_code(m: re.Match) -> str:
+    # Short inline code is usually a name worth saying (a command, flag, path
+    # or file; fix_pronunciation voices the syntax). Long spans are dropped.
+    code = m.group(1).strip()
+    return code if 0 < len(code) <= 60 else ""
+
+
+def _speak_table_row(m: re.Match) -> str:
+    cells = [c.strip() for c in m.group(1).split("|")]
+    return ", ".join(c for c in cells if c) + "."
+
+
 def clean_for_speech(text: str) -> str:
     text = re.sub(r"```[\s\S]*?```", "", text)
-    text = re.sub(r"`[^`]+`", "", text)
+    text = re.sub(r"`([^`\n]+)`", _speak_inline_code, text)
     text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
     text = re.sub(r"https?://\S+", "", text)
-    text = re.sub(r"[*_#>|]", "", text)
-    text = re.sub(r"\|[^\n]+\|", "", text)
+    # Tables: drop the |---| rule, read each row as a comma-separated phrase.
+    text = re.sub(r"^[ \t]*\|?([ \t]*:?-{2,}:?[ \t]*\|)+[ \t]*(:?-{2,}:?)?[ \t]*(\n|\Z)", "",
+                  text, flags=re.MULTILINE)
+    text = re.sub(r"^[ \t]*\|(.*)\|[ \t]*$", _speak_table_row, text, flags=re.MULTILINE)
+    # Emphasis underscores disappear; snake_case is kept for the lexicon
+    # (x86_64, io_uring) and split into words in fix_pronunciation.
+    text = re.sub(r"(?<!\w)_+|_+(?!\w)", "", text)
+    text = re.sub(r"^[ \t]*#+[ \t]*", "", text, flags=re.MULTILINE)  # headings, not C#
+    text = re.sub(r"^[ \t]*>[ \t]?", "", text, flags=re.MULTILINE)   # quotes, not -> or =>
+    text = re.sub(r"[*|]", "", text)
     text = re.sub(r"^\s*\d+\.\s+", "", text, flags=re.MULTILINE)
     text = re.sub(r"^\s*[-•]\s+", "", text, flags=re.MULTILINE)
     text = re.sub(r"\n{2,}", ". ", text)
     text = re.sub(r"\n", " ", text)
+    text = re.sub(r"(?<!\S)-{2,}(?!\S)", " ", text)  # "--" as a dash, not --flags
     text = re.sub(r"\s{2,}", " ", text)
-    text = re.sub(r"-{2,}", " ", text)
     return text.strip()
 
 
-def fix_pronunciation(text: str) -> str:
-    for term, replacement in PRONOUNCE.items():
-        text = re.sub(rf"\b{re.escape(term)}(?!\w)", replacement, text)
-    return text
+# Spoken forms for file extensions and domains after a dot ("main.rs" -> "main dot R S").
+EXTENSIONS = {
+    "py": "pie", "pyi": "pie I", "pyc": "pie C", "ipynb": "I pie N B", "js": "J S", "mjs": "M J S",
+    "cjs": "C J S", "ts": "T S", "tsx": "T S X", "jsx": "J S X", "mts": "M T S", "d": "D",
+    "rs": "R S", "go": "go", "c": "C", "h": "H", "cc": "C C", "cpp": "C P P", "hpp": "H P P",
+    "cs": "C S", "csproj": "C S proj", "java": "java", "kt": "K T", "kts": "K T S", "rb": "R B",
+    "php": "P H P", "swift": "swift", "lua": "lua", "zig": "zig", "ex": "E X", "exs": "E X S",
+    "sh": "S H", "bash": "bash", "zsh": "Z S H", "fish": "fish", "ps1": "P S one",
+    "json": "jason", "jsonl": "jason L", "yaml": "yaml", "yml": "yaml", "toml": "tommel",
+    "ini": "ini", "cfg": "config", "conf": "conf", "env": "env", "lock": "lock", "xml": "X M L",
+    "md": "M D", "mdx": "M D X", "txt": "text", "rst": "R S T", "csv": "C S V", "tsv": "T S V",
+    "log": "log", "sql": "sequel", "db": "D B", "sqlite": "S Q lite", "html": "H T M L",
+    "htm": "H T M", "css": "C S S", "scss": "S C S S", "svg": "S V G", "png": "P N G",
+    "jpg": "jay peg", "jpeg": "jay peg", "gif": "gif", "webp": "web P", "ico": "icon", "pdf": "P D F",
+    "wav": "wave", "mp3": "M P three", "mp4": "M P four", "zip": "zip", "tar": "tar", "gz": "G Z",
+    "tgz": "T G Z", "xz": "X Z", "zst": "Z S T", "deb": "deb", "rpm": "R P M", "so": "S O",
+    "dll": "D L L", "exe": "exe", "wasm": "wazzum", "service": "service", "timer": "timer",
+    "socket": "socket", "desktop": "desktop", "patch": "patch", "diff": "diff", "pem": "pem",
+    "key": "key", "crt": "C R T", "pub": "pub", "nix": "nix", "tf": "T F", "proto": "proto",
+    "gradle": "gradle", "vue": "view", "svelte": "svelte", "astro": "astro",
+    "com": "com", "org": "org", "net": "net", "io": "I O", "dev": "dev", "ai": "A I",
+    "app": "app",
+}
+
+SPOKEN_SYMBOLS = [
+    (r"(?<!\w)e\.g\.", "for example"), (r"(?<!\w)i\.e\.", "that is"),
+    (r"\s&&\s", " and "), (r"\s->\s", " to "), (r"\s=>\s", " arrow "),
+    (r"\s!==?\s", " not equal "), (r"\s===?\s", " equals "), (r"\s<=\s", " less or equal "),
+    (r"\s>=\s", " greater or equal "), (r"(?<!\w)#(\d+)", r"number \1"),
+    (r"(?<![\w$])\$\{?([A-Za-z_]\w*)\}?", r"dollar \1"), (r"(?<![\w.])@(?=[A-Za-z])", "at "),
+    (r"(?<=[\w\x00])::(?=[\w\x00])", " "),
+    (r"(?<=[\w\x00)\]])\?\.(?=[\w\x00])", " optional "), (r"\s\?\?\s", " or "),
+]
+
+_lexicon_cache: tuple = (None, None)
+
+
+def _lexicon_regex(table: dict):
+    global _lexicon_cache
+    key = hash(frozenset(table.items()))
+    if _lexicon_cache[0] != key:
+        pattern = "|".join(re.escape(t) for t in sorted(table, key=len, reverse=True))
+        _lexicon_cache = (key, re.compile(rf"(?<!\w)(?:{pattern})(?!\w)", re.IGNORECASE))
+    return _lexicon_cache[1]
+
+
+def _speak_flag(m: re.Match) -> str:
+    dashes, name, eq = m.group(1), m.group(2), m.group(3)
+    if dashes == "-" and len(name) <= 3:
+        name = " ".join(name.upper())  # -rf -> R F
+    spoken = ("dash dash " if dashes == "--" else "dash ") + name.replace("-", " ")
+    return spoken + (" equals " if eq else "")
+
+
+def _speak_path(m: re.Match) -> str:
+    token = m.group(0)
+    trail = re.search(r"[.,;:!?)]*$", token).group(0)
+    token = token[:len(token) - len(trail)]
+    if "/" not in token:
+        return m.group(0)
+    rooted = token.startswith(("/", "~", "./", "../", "@"))
+    if not rooted and token.count("/") < 2 and not re.search(r"\.[A-Za-z]", token):
+        return m.group(0)  # and/or, I/O, client/server, 24/7
+    parts = token.rstrip("/").split("/")
+    lead = []
+    if parts and parts[0] == "":
+        parts = parts[1:]
+        lead = ["slash"]
+    if len(parts) > 4:
+        parts, lead = parts[-3:], []  # long paths: just the tail
+    words = {"~": "home", ".": "dot", "..": "dot dot"}
+    spoken = [words.get(p, p) for p in parts if p]
+    return " ".join(lead + [" slash ".join(spoken)]) + trail
+
+
+def _speak_dots(text: str) -> str:
+    def ext(m):
+        spoken = EXTENSIONS.get(m.group(1).lower())
+        return f" dot {spoken}" if spoken else m.group(0)
+    text = re.sub(r"(?<=[\w\x00])\.([A-Za-z][A-Za-z0-9]{0,6})(?!\w)", ext, text)
+    # dotfiles: .env, .gitignore, .config
+    return re.sub(r"(?<![\w.\x00])\.([a-z][\w-]*)", r"dot \1", text)
+
+
+def _split_camel(m: re.Match) -> str:
+    return re.sub(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z]{2})(?=[A-Z][a-z]{2})", " ", m.group(0))
+
+
+def fix_pronunciation(text: str, extra: dict | None = None) -> str:
+    """Rewrite one sentence the way a developer would say it (spoken text only).
+
+    1. Lexicon terms (PRONOUNCE + user `extra`, longest first; a lowercase
+       key also matches its Capitalized form) become placeholders, so later
+       rules can't break keys like "Next.js" or "CI/CD" or re-substitute.
+    2. Syntax: symbols, --flags, -x flags, /paths and /slash-commands,
+       .ext and .dotfiles, snake_case and camelCase.
+    3. Lexicon again on words the syntax rules exposed, then placeholders
+       are filled in.
+    """
+    table = {**PRONOUNCE, **(extra or {})}
+    regex = _lexicon_regex(table)
+    filled: list[str] = []
+
+    def lookup(m: re.Match) -> str:
+        term = m.group(0)
+        if term in table:
+            spoken = table[term]
+        elif term[:1].isupper() and term[1:].islower() and term.lower() in table:
+            spoken = table[term.lower()]
+        else:
+            return term
+        filled.append(spoken)
+        return f"\x00{len(filled) - 1}\x00"
+
+    text = regex.sub(lookup, text)
+    text = re.sub(r"(?<![\w-])(--?)([A-Za-z][\w-]*)(=?)", _speak_flag, text)
+    text = re.sub(r"(?<!\S)[\w.~@\x00/-]*/[\w.~@\x00/-]*[.,;:!?)]*(?!\S)", _speak_path, text)
+    for pattern, spoken in SPOKEN_SYMBOLS:
+        text = re.sub(pattern, spoken, text)
+    text = _speak_dots(text)
+    text = re.sub(r"(?<=[^\W_])_+(?=[^\W_])", " ", text)  # snake_case
+    text = re.sub(r"\b[A-Za-z]+(?:[a-z0-9][A-Z]|[A-Z]{2}[a-z]{2})[A-Za-z0-9]*\b", _split_camel, text)
+    text = regex.sub(lookup, text)
+    text = re.sub(r"\x00(\d+)\x00", lambda m: filled[int(m.group(1))], text)
+    return re.sub(r"\s{2,}", " ", text)
 
 
 def split_sentences(text: str) -> list[str]:
@@ -721,7 +865,7 @@ def synth_kokoro(text: str, voice: str, speed: float, cfg: dict):
     # Split once: substitutions such as "vs." -> "versus" remove punctuation,
     # so splitting the spoken text again can detach timings from display words.
     for display_sentence in split_sentences(text):
-        sentence = fix_pronunciation(display_sentence)
+        sentence = fix_pronunciation(display_sentence, cfg.get("pronunciations"))
         chunks = []
         for result in pipe(sentence, voice=voice, speed=speed):
             chunks.append(result.audio.numpy())
@@ -743,7 +887,7 @@ def synth_kokoro(text: str, voice: str, speed: float, cfg: dict):
 
 
 def synth_system(text: str, voice: str, speed: float, cfg: dict):
-    speech = fix_pronunciation(text)
+    speech = fix_pronunciation(text, cfg.get("pronunciations"))
     rate_wpm = str(int(175 * speed))
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
         path = f.name
@@ -1624,7 +1768,7 @@ def _invoker() -> str:
 
 
 SLASH_TEMPLATE = """---
-description: "Control voice output: on, off, mute, status, provider <name>, voice <name>, speed <x>, volume <x>, theme <name>, history on|off, voices"
+description: "Control voice output: on, off, mute, status, pronounce <term> <spoken>, provider <name>, voice <name>, speed <x>, volume <x>, theme <name>, history on|off, voices"
 allowed-tools: "Bash({invoker} slash:*)"
 ---
 
@@ -2364,6 +2508,19 @@ def cmd_slash(args):
             cfg["history_enabled"] = rest[0].lower() == "on"
             save_config(cfg)
             print(f"private response history set to {rest[0].lower()}")
+        elif action == "pronounce":
+            table = cfg.setdefault("pronunciations", {})
+            if len(rest) >= 2:
+                table[rest[0]] = " ".join(rest[1:])
+                save_config(cfg)
+                print(f"'{rest[0]}' will be spoken as '{table[rest[0]]}'")
+            elif len(rest) == 1 and rest[0] in table:
+                del table[rest[0]]
+                save_config(cfg)
+                print(f"removed pronunciation for '{rest[0]}'")
+            else:
+                print(f"{len(table)} custom pronunciations (config: {CONFIG_PATH}); "
+                      "usage: /voice pronounce <term> <spoken form>  |  /voice pronounce <term> to remove")
         elif action == "voices":
             target = cfg.get("provider", "kokoro")
             names = {"kokoro": list(KOKORO_VOICES), "openai": list(OPENAI_VOICES),
@@ -2373,8 +2530,9 @@ def cmd_slash(args):
         elif action == "providers":
             print("providers: " + ", ".join(f"{p} ({PROVIDERS[p]['blurb']})" for p in PROVIDERS))
         else:
-            print("usage: /voice [on|off|toggle|mute|unmute|status|provider <name>|voice <name>|"
-                  "speed <x>|volume <x>|theme <name>|announce on|off|history on|off|voices|providers]")
+            print("usage: /voice [on|off|toggle|mute|unmute|status|pronounce <term> <spoken>|"
+                  "provider <name>|voice <name>|speed <x>|volume <x>|theme <name>|announce on|off|"
+                  "history on|off|voices|providers]")
     except (ProviderError, ValueError) as e:
         print(f"error: {e}")
 
