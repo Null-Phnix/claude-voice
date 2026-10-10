@@ -68,11 +68,13 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 try:
     import numpy as np
+except ImportError:
+    np = None
+
+try:
     import sounddevice as sd
 except (ImportError, OSError):
-    # sounddevice raises OSError, not ImportError, when its Python package is
-    # installed but the host PortAudio library is unavailable (common in CI).
-    np = None
+    # PortAudio may be absent on headless hosts; keep NumPy for mocked tests.
     sd = None
 
 VERSION = "0.3.0"
