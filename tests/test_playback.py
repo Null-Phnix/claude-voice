@@ -140,6 +140,18 @@ class StreamingSpeakTests(unittest.TestCase):
         time.sleep(0.5)
         self.assertLess(len(synthesized), 4)
 
+    def test_no_chime_when_nothing_was_spoken(self):
+        cfg = dict(cv.default_config(), chime=True, done_pause=0)
+        device = fake_sd()
+        device.play = mock.Mock()
+        with (
+            mock.patch.object(cv, "sd", device),
+            mock.patch.object(cv, "load_config", return_value=cfg),
+            mock.patch.object(cv, "get_pipe", return_value=lambda s, **k: iter(())),
+        ):
+            cv.speak_and_highlight("Hello.", provider="kokoro", record_history=False, render=False)
+        device.play.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1291,7 +1291,7 @@ def speak_and_highlight(text: str, provider: str | None = None, voice: str | Non
             out.write(f"\r\033[2A\033[K{header}\n\033[K  {SPOKEN}done{RESET}\n\033[K  {bar}")
             out.flush()
             time.sleep(done_pause)
-        if chime:
+        if chime and state["ttfa"] is not None:
             play_chime_end()
     if started:
         _clear_ui(out)
