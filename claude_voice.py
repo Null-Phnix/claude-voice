@@ -281,6 +281,7 @@ _muted_ttys: set[str] = set()
 # Current or most recent Player, kept so the daemon can pause, resume and
 # seek within the last message.
 _player = None
+_synthesis_lock = threading.Lock()
 _speaking_tty: str | None = None
 
 
@@ -784,7 +785,7 @@ def _lexicon_regex(table: dict):
 
 def _speak_flag(m: re.Match) -> str:
     dashes, name, eq = m.group(1), m.group(2), m.group(3)
-    if dashes == "-" and len(name) <= 3:
+    if dashes == "-" and len(name) <= 3 and "\x00" not in name:
         name = " ".join(name.upper())  # -rf -> R F
     spoken = ("dash dash " if dashes == "--" else "dash ") + name.replace("-", " ")
     return spoken + (" equals " if eq else "")
@@ -851,7 +852,7 @@ def fix_pronunciation(text: str, extra: dict | None = None) -> str:
         return f"\x00{len(filled) - 1}\x00"
 
     text = regex.sub(lookup, text)
-    text = re.sub(r"(?<![\w-])(--?)([A-Za-z][\w-]*)(=?)", _speak_flag, text)
+    text = re.sub(r"(?<![\w-])(--?)((?:[A-Za-z]|\x00\d+\x00)[\w\x00-]*)(=?)", _speak_flag, text)
     text = re.sub(r"(?<!\S)[\w.~@\x00/-]*/[\w.~@\x00/-]*[.,;:!?)]*(?!\S)", _speak_path, text)
     for pattern, spoken in SPOKEN_SYMBOLS:
         text = re.sub(pattern, spoken, text)
@@ -1368,7 +1369,10 @@ def speak_and_highlight(text: str, provider: str | None = None, voice: str | Non
         _log_history(text, provider, voice)
 
     def produce():
+        _synthesis_lock.acquire()
         try:
+            if player.stopped:
+                return
             for audio, rate, piece_words, piece_timings in _synth_pieces(
                     provider, text, voice, speed, cfg):
                 if player.stopped:
@@ -1390,6 +1394,7 @@ def speak_and_highlight(text: str, provider: str | None = None, voice: str | Non
         finally:
             state["gen_time"] = time.monotonic() - t0
             player.finish_input()
+            _synthesis_lock.release()
 
     out = None
     if render:
@@ -1633,10 +1638,36 @@ def _load_sessions() -> dict:
 
 def _save_sessions(sessions: dict) -> None:
     os.makedirs(RUNTIME_DIR, mode=0o700, exist_ok=True)
-    tmp = SESSIONS_PATH + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(sessions, f, indent=2)
-    os.replace(tmp, SESSIONS_PATH)
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", dir=RUNTIME_DIR,
+                                         prefix="sessions-", delete=False) as f:
+            tmp = f.name
+            json.dump(sessions, f, indent=2)
+        os.replace(tmp, SESSIONS_PATH)
+    finally:
+        if tmp and os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def _update_session(session_id: str, verb: str, value: str | None = None) -> None:
+    os.makedirs(RUNTIME_DIR, mode=0o700, exist_ok=True)
+    fd = os.open(SESSIONS_PATH + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
+    with os.fdopen(fd, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        sessions = _load_sessions()
+        entry = sessions.setdefault(session_id, {})
+        if verb in ("on", "off"):
+            entry["enabled"] = verb == "on"
+        elif verb in ("voice", "provider"):
+            entry[verb] = value
+        else:
+            entry.clear()
+        if entry:
+            entry["t"] = time.time()
+        else:
+            sessions.pop(session_id, None)
+        _save_sessions(sessions)
 
 
 def _project_key(cwd: str | None) -> str:
@@ -2755,8 +2786,7 @@ def cmd_slash(args):
         if scope == "session":
             if not session_id:
                 return "error: CLAUDE_CODE_SESSION_ID not set; run /voice inside Claude Code"
-            sessions = _load_sessions()
-            entry = sessions.setdefault(session_id, {})
+            entry = {}
         else:
             entry = cfg.setdefault("projects", {}).setdefault(project_dir, {})
         if verb in ("on", "off"):
@@ -2770,11 +2800,7 @@ def cmd_slash(args):
         else:
             return f"usage: /voice {scope} on|off|voice <name>|provider <name>|clear"
         if scope == "session":
-            if entry:
-                entry["t"] = time.time()
-            else:
-                sessions.pop(session_id, None)
-            _save_sessions(sessions)
+            _update_session(session_id, verb, entry.get(verb))
         else:
             if not entry:
                 cfg["projects"].pop(project_dir, None)

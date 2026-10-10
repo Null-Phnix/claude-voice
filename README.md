@@ -51,8 +51,8 @@ So I built a Claude Code **Stop hook**. After every response, the hook fires, st
 - **Per-terminal mute** — `claude-voice mute` silences the current terminal only
 - **Highlight-and-speak hotkey** — select any text in any app, press a key, and the daemon reads it back (Hammerspoon snippet included)
 - **Opt-in private history** — save up to 200 spoken responses locally, replay them, and seek or pause the latest synthesized audio
-- **Smart filtering** — skips code-heavy responses, strips markdown/URLs/tables, fixes dev pronunciations for local engines
-- **Interrupt on keypress** — press any key to stop immediately
+- **Smart filtering**: skips code-heavy responses, removes fenced code and URLs, speaks short inline code and table cells, and supports custom local pronunciations
+- **Playback controls**: stop, pause, and resume from Claude Code; standalone karaoke can also stop on a keypress
 - **Themes** — aurora, ember, violet, mint, mono
 - **One-command setup** — `claude-voice setup` installs the hooks and the slash command
 
@@ -120,7 +120,33 @@ Cloud providers that return MP3 need `ffmpeg` on PATH (`brew install ffmpeg`).
 /voice voices              list voices for the current provider
 ```
 
-The command runs instantly (it executes before the prompt is sent) and Claude just relays the result.
+The command runs instantly (it executes before the prompt is sent) and Claude just relays the result. The Stop hook does not speak that relay, so a pause command stays paused.
+
+### Playback and session controls
+
+```text
+/voice stop                      stop the current response
+/voice pause                     pause at the current position
+/voice resume                    continue playback
+/voice session off               silence this Claude Code session
+/voice session voice af_heart    override its voice
+/voice session provider kokoro   override its provider
+/voice session clear             remove this session's overrides
+/voice project off               silence this project and its subdirectories
+/voice project voice am_fenrir   set a project voice
+/voice project clear             remove this project's overrides
+/voice default off               silence sessions without an enabling rule
+/voice pronounce pytest pie test add a pronunciation for local speech
+/voice pronounce pytest          remove that custom pronunciation
+```
+
+Session settings override project settings, which override defaults. The longest matching project directory wins. Session overrides are stored locally in `~/.cache/claude-voice/sessions.json` and expire one week after their last update. The global `/voice off` switch still disables all hook speech.
+
+Kokoro streams one sentence at a time. Cloud providers still synthesize a full response before playback. A normal prompt pauses speech from the same terminal by default; set `pause_on_prompt` to `any` or `off` to change this. Stopping playback is immediate, but an in-flight synthesis must finish before the shared engine can start another response.
+
+Hooks play audio without drawing into Claude Code or taking its keyboard input. Set `hook_karaoke` to `true` only if you accept those terminal interactions; standalone terminal runs still render karaoke. The ancestor-terminal lookup is Linux-specific; macOS retains the existing terminal fallback.
+
+Custom pronunciations are applied by Kokoro and the system provider, not cloud providers. Short inline code and table cells are retained for speech; fenced code and URLs are removed.
 
 ---
 
@@ -185,7 +211,12 @@ claude-voice --no-daemon "text" # bypass the daemon; speak in-process
   "history_enabled": false,
   "use_daemon": true,
   "min_chars": 30,
-  "max_chars": 1500,
+  "max_chars": 8000,
+  "hook_karaoke": false,
+  "pause_on_prompt": "same",
+  "default_enabled": true,
+  "projects": {},
+  "pronunciations": {},
   "keys": {}
 }
 ```
@@ -196,7 +227,7 @@ claude-voice --no-daemon "text" # bypass the daemon; speak in-process
 
 1. Claude Code fires the **Stop hook** after every response
 2. Hook reads the response text from stdin JSON (`last_assistant_message`, with a fallback that parses `transcript_path` on newer Claude Code versions)
-3. Strips markdown, code blocks, URLs, tables — keeps only speakable text; skips responses that are mostly code
+3. Removes markdown formatting, fenced code and URLs; retains short inline code and table cells, and skips responses that are mostly code
 4. The hook hands the text to the **daemon** (spawning it if needed), which synthesizes with the active provider
 5. Audio plays while word-by-word highlighting renders to the calling terminal's tty — ElevenLabs uses real character timestamps, everything else uses length-weighted estimation
 6. Any keypress interrupts instantly; display cleans up after itself
