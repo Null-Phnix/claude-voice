@@ -1200,6 +1200,36 @@ def extract_hook_text(raw: str) -> str:
     return ""
 
 
+def _turn_was_voice_command(data: dict) -> bool:
+    """True when the turn that just ended answered a /voice command.
+
+    Its reply only relays the command's result ("paused"), so speaking it
+    would undo a pause or announce a mute out loud.
+    """
+    path = data.get("transcript_path")
+    if not path or not os.path.exists(path):
+        return False
+    try:
+        with open(path) as f:
+            lines = f.readlines()[-200:]
+    except OSError:
+        return False
+    for line in reversed(lines):
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if obj.get("type") != "user" or obj.get("isMeta"):
+            continue
+        content = (obj.get("message") or {}).get("content")
+        if isinstance(content, list):
+            if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
+                continue
+            content = " ".join(b.get("text", "") for b in content if isinstance(b, dict))
+        return "<command-name>/voice</command-name>" in (content or "")
+    return False
+
+
 # ── daemon ──
 #
 # Why a daemon exists: loading Kokoro takes ~6–10s, and the Claude Code Stop
@@ -2461,6 +2491,12 @@ def main():
         if not cfg.get("enabled", True):
             sys.exit(0)
         raw = sys.stdin.read().strip()
+        try:
+            hook = json.loads(raw)
+        except json.JSONDecodeError:
+            hook = None
+        if isinstance(hook, dict) and _turn_was_voice_command(hook):
+            sys.exit(0)
         text = extract_hook_text(raw)
         if text and is_mostly_code(text):
             sys.exit(0)
