@@ -21,9 +21,12 @@ class PronunciationTests(unittest.TestCase):
                 self.assertEqual(cv.fix_pronunciation(text), expected)
 
     def test_terms_do_not_match_inside_longer_identifiers(self):
-        for text in ("revs.", "_vs.", "vs.cloud", "vs._private", "APIs", "GPU_0"):
+        for text in ("revs.", "_vs.", "vs.cloud", "vs._private", "APIs"):
             with self.subTest(text=text):
                 self.assertEqual(cv.fix_pronunciation(text), text)
+
+    def test_snake_case_parts_are_pronounced_as_words(self):
+        self.assertEqual(cv.fix_pronunciation("GPU_0"), "G P U 0")
 
     def test_existing_word_pronunciations_still_match(self):
         self.assertEqual(cv.fix_pronunciation("API, GPU."), "A P I, G P U.")
