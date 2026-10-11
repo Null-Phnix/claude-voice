@@ -147,13 +147,38 @@ def test_daemon_does_not_replay_partial_audio_after_failure(audio, monkeypatch, 
     assert "late device failure" in capsys.readouterr().err
 
 
-def test_direct_cli_failure_exits_nonzero(monkeypatch):
+@pytest.mark.parametrize("error", ["synthesis failed", ""])
+def test_direct_cli_failure_exits_nonzero(monkeypatch, error):
     monkeypatch.setattr(cv, "load_config", cv.default_config)
     monkeypatch.setattr(cv.sys, "argv", ["claude-voice", "--no-daemon", "Hello."])
     monkeypatch.setattr(cv, "_resolve_tty", lambda: "/dev/null")
     monkeypatch.setattr(cv.os, "isatty", lambda fd: False)
     monkeypatch.setattr(cv, "speak_and_highlight",
-                        lambda *args, **kwargs: {"finished": False, "error": "synthesis failed"})
+                        lambda *args, **kwargs: {"finished": False, "error": error})
     with pytest.raises(SystemExit) as result:
         cv.main()
     assert result.value.code == 1
+
+
+@pytest.mark.parametrize("command", [cv.cmd_demo, cv.cmd_benchmark])
+@pytest.mark.parametrize("failed", [True, False])
+def test_demo_and_benchmark_do_not_summarize_incomplete_playback(monkeypatch, capsys,
+                                                               command, failed):
+    result = {"finished": False, "ttfa": 0.1, "gen_time": 0.2, "audio_duration": 0.1,
+              "total_time": 0.2, "words": 1}
+    if failed:
+        result["error"] = "synthesis failed"
+    monkeypatch.setattr(cv, "load_config", cv.default_config)
+    speak = mock.Mock(return_value=result)
+    monkeypatch.setattr(cv, "speak_and_highlight", speak)
+    if failed:
+        with pytest.raises(SystemExit) as status:
+            command()
+        assert status.value.code == 1
+    else:
+        command()
+    stdout = capsys.readouterr().out
+    assert "Demo complete" not in stdout
+    assert "Avg time to first audio" not in stdout
+    assert ("failed" if failed else "stopped") in stdout
+    speak.assert_called_once()

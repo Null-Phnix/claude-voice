@@ -144,7 +144,7 @@ Session settings override project settings, which override defaults. The longest
 
 Kokoro streams one sentence at a time. Cloud providers still synthesize a full response before playback. A normal prompt pauses speech from the same terminal by default; set `pause_on_prompt` to `any` or `off` to change this. Stopping playback is immediate, but an in-flight synthesis must finish before the shared engine can start another response.
 
-Resume and seek wait for the first audio chunk before opening the output stream, so system and custom voices keep their native sample rate. Synthesis failures are reported even after playback starts; partial responses are not automatically replayed. Direct in-process CLI playback exits unsuccessfully when synthesis fails.
+Resume and seek wait for the first audio chunk before opening the output stream, so system and custom voices keep their native sample rate. Synthesis failures are reported even after playback starts; partial responses are not automatically replayed. Direct text playback with `--no-daemon`, demos and benchmarks exit nonzero on synthesis failure. Interrupted runs do not produce a success summary or benchmark averages.
 
 Hooks play audio without drawing into Claude Code or taking its keyboard input. Set `hook_karaoke` to `true` only if you accept those terminal interactions; standalone terminal runs still render karaoke. The ancestor-terminal lookup is Linux-specific; macOS retains the existing terminal fallback.
 

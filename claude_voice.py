@@ -2684,10 +2684,15 @@ def cmd_demo(args=None):
     print(f"  {LABEL}provider: {provider}  |  voice: {voice or 'default'}  |  {where}{RESET}\n")
     time.sleep(0.5)
     stats = speak_and_highlight(DEMO_TEXT, show_stats=True)
-    if stats:
-        print(f"\n  {GREEN}Demo complete.{RESET}")
-        print(f"  {LABEL}ttfa={stats['ttfa']:.2f}s · gen={stats['gen_time']:.2f}s · "
-              f"{stats['words']} words{RESET}\n")
+    if not stats or "error" in stats or not stats.get("finished"):
+        failed = not stats or "error" in stats
+        print(f"\n  {RED if failed else YELLOW}Demo {'failed' if failed else 'stopped'}.{RESET}")
+        if failed:
+            sys.exit(1)
+        return
+    print(f"\n  {GREEN}Demo complete.{RESET}")
+    print(f"  {LABEL}ttfa={stats['ttfa']:.2f}s · gen={stats['gen_time']:.2f}s · "
+          f"{stats['words']} words{RESET}\n")
 
 
 def cmd_benchmark(args=None):
@@ -2703,8 +2708,12 @@ def cmd_benchmark(args=None):
     for i, sentence in enumerate(BENCHMARK_SENTENCES):
         print(f"  {DIM}[{i + 1}/3] {labels[i]}...{RESET}", end="", flush=True)
         stats = speak_and_highlight(sentence, show_stats=True)
-        if not stats:
-            print(f"\r\033[K  {RED}[{i + 1}/3] {labels[i]} failed{RESET}")
+        if not stats or "error" in stats or not stats.get("finished"):
+            failed = not stats or "error" in stats
+            outcome = "failed" if failed else "stopped"
+            print(f"\r\033[K  {RED if failed else YELLOW}[{i + 1}/3] {labels[i]} {outcome}{RESET}")
+            if failed:
+                sys.exit(1)
             return
         results.append(stats)
         print(f"\r\033[K  {GREEN}[{i + 1}/3] {labels[i]}{RESET}  "
@@ -3060,7 +3069,7 @@ def main():
     try:
         result = speak_and_highlight(text, provider=provider, voice=voice, tty_path=tty_path,
                                      render=render)
-        if result.get("error") and not hook_mode:
+        if "error" in result and not hook_mode:
             sys.exit(1)
     except Exception as e:
         if _tty:
