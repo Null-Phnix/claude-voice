@@ -144,6 +144,8 @@ Session settings override project settings, which override defaults. The longest
 
 Kokoro streams one sentence at a time. Cloud providers still synthesize a full response before playback. A normal prompt pauses speech from the same terminal by default; set `pause_on_prompt` to `any` or `off` to change this. Stopping playback is immediate, but an in-flight synthesis must finish before the shared engine can start another response.
 
+Resume and seek wait for the first audio chunk before opening the output stream, so system and custom voices keep their native sample rate. Synthesis failures are reported even after playback starts; partial responses are not automatically replayed. Direct in-process CLI playback exits unsuccessfully when synthesis fails.
+
 Hooks play audio without drawing into Claude Code or taking its keyboard input. Set `hook_karaoke` to `true` only if you accept those terminal interactions; standalone terminal runs still render karaoke. The ancestor-terminal lookup is Linux-specific; macOS retains the existing terminal fallback.
 
 Custom pronunciations are applied by Kokoro and the system provider, not cloud providers. Short inline code and table cells are retained for speech; fenced code and URLs are removed.
@@ -229,8 +231,8 @@ claude-voice --no-daemon "text" # bypass the daemon; speak in-process
 2. Hook reads the response text from stdin JSON (`last_assistant_message`, with a fallback that parses `transcript_path` on newer Claude Code versions)
 3. Removes markdown formatting, fenced code and URLs; retains short inline code and table cells, and skips responses that are mostly code
 4. The hook hands the text to the **daemon** (spawning it if needed), which synthesizes with the active provider
-5. Audio plays while word-by-word highlighting renders to the calling terminal's tty — ElevenLabs uses real character timestamps, everything else uses length-weighted estimation
-6. Any keypress interrupts instantly; display cleans up after itself
+5. Hooks play audio without changing Claude Code's display; standalone terminal runs can show word highlighting. ElevenLabs uses character timestamps, while other providers estimate timings.
+6. Playback supports stop, pause and resume. When standalone karaoke is enabled, a keypress interrupts and the display cleans up afterward.
 
 ---
 

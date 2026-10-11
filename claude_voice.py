@@ -667,7 +667,13 @@ class Player:
 
     def _ensure_stream(self) -> None:
         with self._lock:
-            if self._stream is not None:
+            if self._stream is not None or self.stopped:
+                return
+            # Resume/seek can arrive while the provider is still synthesizing.
+            # The first nonempty chunk establishes its actual sample rate.
+            if not len(self._buf):
+                if self._input_done:
+                    self.drained.set()
                 return
             stream = sd.OutputStream(samplerate=self.rate, channels=1, dtype="float32",
                                      callback=self._callback)
@@ -1427,21 +1433,12 @@ def speak_and_highlight(text: str, provider: str | None = None, voice: str | Non
 
     if _interrupted:
         player.stop()
-    finished = player.drained.is_set() and not player.stopped
+    error = state["error"]
+    finished = player.drained.is_set() and not player.stopped and error is None
     if out is not None:
         _restore_terminal()
         if not started:
             spinner.stop()
-    if state["error"] is not None and state["ttfa"] is None:
-        e = state["error"]
-        if out is not None:
-            out.write(f"  {RED}✗{RESET} {LABEL}claude-voice ({provider}):{RESET} {e}\n{SHOW_CURSOR}")
-            out.flush()
-        sys.stderr.write(f"claude-voice: {provider}: {e}\n")
-        if not isinstance(e, ProviderError):
-            raise e  # audio device trouble: let the daemon reinitialize and retry
-        return {}
-
     if finished:
         if started:
             header = render_header(provider, voice, player.duration, player.duration)
@@ -1457,6 +1454,14 @@ def speak_and_highlight(text: str, provider: str | None = None, voice: str | Non
         out.write(SHOW_CURSOR)
         out.flush()
 
+    # Report failures after clearing karaoke so the diagnostic stays visible.
+    # A later sentence can fail even though the first chunk already played.
+    if error is not None:
+        if out is not None:
+            out.write(f"  {RED}✗{RESET} {LABEL}claude-voice ({provider}):{RESET} {error}\n")
+            out.flush()
+        sys.stderr.write(f"claude-voice: {provider}: {error}\n")
+
     stats = {
         "ttfa": state["ttfa"] or 0.0,
         "gen_time": state["gen_time"] or 0.0,
@@ -1468,14 +1473,21 @@ def speak_and_highlight(text: str, provider: str | None = None, voice: str | Non
         "provider": provider,
         "finished": finished,
     }
+    if error is not None:
+        stats["error"] = str(error)
     if not show_stats:
+        outcome = "failed" if error is not None else ("done" if finished else "stopped")
         sys.stderr.write(
             f"claude-voice: ttfa={stats['ttfa']:.2f}s gen={stats['gen_time']:.2f}s "
             f"total={stats['total_time']:.2f}s words={len(words)} provider={provider} "
-            f"voice={voice} {'done' if finished else 'stopped'}\n"
+            f"voice={voice} {outcome}\n"
         )
     if out is not None and out is not sys.stderr:
         out.close()
+    # Keep the daemon's device-recovery retry before any audio starts. Once
+    # playback has begun, return the partial failure instead of replaying it.
+    if error is not None and state["ttfa"] is None and not isinstance(error, ProviderError):
+        raise error
     return stats
 
 
@@ -3046,8 +3058,10 @@ def main():
         # Daemon reachable but request errored — fall through to in-process.
 
     try:
-        speak_and_highlight(text, provider=provider, voice=voice, tty_path=tty_path,
-                            render=render)
+        result = speak_and_highlight(text, provider=provider, voice=voice, tty_path=tty_path,
+                                     render=render)
+        if result.get("error") and not hook_mode:
+            sys.exit(1)
     except Exception as e:
         if _tty:
             _tty.write(SHOW_CURSOR)

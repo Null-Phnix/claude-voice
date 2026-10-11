@@ -1,6 +1,7 @@
 """Regression coverage for the combined voice contributions."""
 import multiprocessing
 import os
+import sys
 import tempfile
 import threading
 from types import SimpleNamespace
@@ -9,7 +10,10 @@ from unittest import mock
 import numpy as np
 import pytest
 
-import claude_voice as cv
+# Spawned session writers need file locking, not PortAudio device discovery.
+# Keep this module headless even on hosts with sounddevice installed.
+with mock.patch.dict(sys.modules, {"sounddevice": None}):
+    import claude_voice as cv
 
 
 @pytest.mark.parametrize("text,extra,expected", [
