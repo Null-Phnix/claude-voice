@@ -72,6 +72,14 @@ class RoutingTests(unittest.TestCase):
             "fake_kokoro.KPipeline = _KPipe\n"
             "sys.modules['kokoro'] = fake_kokoro\n"
             "import claude_voice\n"
+            "class _Silent:\n"
+            "    def __init__(self, *a, **kw): pass\n"
+            "    def start(self): pass\n"
+            "    def stop(self): pass\n"
+            "    abort = close = stop\n"
+            "claude_voice.sd = types.SimpleNamespace(\n"
+            "    OutputStream=_Silent, play=lambda *a, **kw: None,\n"
+            "    wait=lambda: None, stop=lambda: None)\n"
             f"claude_voice.RUNTIME_DIR = {cls._tmp!r}\n"
             f"claude_voice.SOCK_PATH = {cls.sock_path!r}\n"
             f"claude_voice.PID_PATH = {os.path.join(cls._tmp, 'daemon.pid')!r}\n"
@@ -113,7 +121,7 @@ class RoutingTests(unittest.TestCase):
 
     def test_claim_records_active_tty(self):
         resp = _send(self.sock_path, {"op": "claim", "tty_path": "/dev/ttysA"})
-        self.assertEqual(resp, {"ok": True, "active_tty": "/dev/ttysA"})
+        self.assertEqual(resp, {"ok": True, "active_tty": "/dev/ttysA", "paused": False})
         status = _send(self.sock_path, {"op": "status"})
         self.assertEqual(status.get("active_tty"), "/dev/ttysA")
 

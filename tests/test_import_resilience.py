@@ -28,7 +28,10 @@ class ImportResilienceTests(unittest.TestCase):
                     "-c",
                     "import claude_voice; "
                     "assert claude_voice.sd is None; "
-                    "assert claude_voice.np is None",
+                    "assert claude_voice.np is not None; "
+                    "exec('try:\\n claude_voice._require_audio()\\n'"
+                    "'except claude_voice.ProviderError:\\n pass\\n'"
+                    "'else:\\n raise AssertionError(\"audio should be unavailable\")')",
                 ],
                 cwd=tmp,
                 env=env,
