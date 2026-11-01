@@ -2099,20 +2099,48 @@ to fix it.
 """
 
 
+class SettingsError(Exception):
+    """~/.claude/settings.json exists but cannot be read or parsed."""
+
+
 def _load_settings() -> dict:
-    if os.path.exists(SETTINGS_PATH):
-        try:
-            with open(SETTINGS_PATH) as f:
-                return json.load(f)
-        except (json.JSONDecodeError, OSError):
-            pass
-    return {}
+    """Return Claude Code's settings, or {} when the file does not exist yet.
+
+    A file that exists but cannot be parsed raises SettingsError rather than
+    returning {}: setup and uninstall write the result back, and writing {}
+    over a user's hand-edited settings.json would silently destroy every
+    other setting in it (permissions, env, model, other hooks).
+    """
+    if not os.path.exists(SETTINGS_PATH):
+        return {}
+    try:
+        with open(SETTINGS_PATH) as f:
+            settings = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        raise SettingsError(f"{SETTINGS_PATH}: {e}") from e
+    if not isinstance(settings, dict):
+        raise SettingsError(f"{SETTINGS_PATH}: expected a JSON object at the top level")
+    return settings
 
 
 def _save_settings(settings: dict):
+    # Atomic replace so an interrupted write cannot leave a truncated file.
     os.makedirs(os.path.dirname(SETTINGS_PATH), exist_ok=True)
-    with open(SETTINGS_PATH, "w") as f:
+    tmp = SETTINGS_PATH + ".claude-voice.tmp"
+    with open(tmp, "w") as f:
         json.dump(settings, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, SETTINGS_PATH)
+
+
+def _settings_or_exit() -> dict:
+    try:
+        return _load_settings()
+    except SettingsError as e:
+        print(f"  {RED}✗{RESET} could not read Claude Code settings: {e}", file=sys.stderr)
+        print(f"  {DIM}nothing was changed. Fix the JSON (or move the file aside) and re-run.{RESET}",
+              file=sys.stderr)
+        sys.exit(1)
 
 
 def _is_our_hook(entry: dict) -> bool:
@@ -2125,7 +2153,7 @@ def cmd_setup(args=None):
     save_config(cfg)
     invoker = _invoker()
 
-    settings = _load_settings()
+    settings = _settings_or_exit()
     hooks = settings.get("hooks", {})
 
     stop_hooks = [h for h in hooks.get("Stop", []) if not _is_our_hook(h)]
@@ -2172,7 +2200,7 @@ def cmd_setup(args=None):
 
 
 def cmd_uninstall(args=None):
-    settings = _load_settings()
+    settings = _settings_or_exit()
     hooks = settings.get("hooks", {})
     removed = 0
     for event in list(hooks):
@@ -2207,7 +2235,11 @@ def cmd_toggle_state(enable: bool | None, quiet: bool = False) -> str:
 
 
 def _hook_installed() -> bool:
-    return any(_is_our_hook(h) for h in _load_settings().get("hooks", {}).get("Stop", []))
+    try:
+        settings = _load_settings()
+    except SettingsError:
+        return False  # status is read-only; an unreadable file just reads as "not installed"
+    return any(_is_our_hook(h) for h in settings.get("hooks", {}).get("Stop", []))
 
 
 def cmd_status(args=None):

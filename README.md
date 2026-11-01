@@ -106,6 +106,8 @@ Cloud providers that return MP3 need `ffmpeg` on PATH (`brew install ffmpeg`).
 
 `claude-voice setup` installs `~/.claude/commands/voice.md`, so inside Claude Code you can type:
 
+> **Note:** this custom command has the same name as Claude Code's built-in `/voice` (dictation), so while claude-voice is installed, `/voice` runs this tool instead. `claude-voice uninstall` removes only this file and the claude-voice hooks from `~/.claude/settings.json`; built-in commands such as `/voice` and `/rc` live in the Claude Code binary and are not touched. If one is missing after uninstalling, check `claude --version` and `claude doctor`, since their availability depends on your Claude Code version and plan.
+
 ```
 /voice off                 turn speech off globally
 /voice on                  back on
