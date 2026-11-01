@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(gh api -X PATCH repos/Null-Phnix/*)",
+      "Bash(gh api repos/Null-Phnix/*/issues/*/comments *)",
+      "Bash(gh issue close *)",
+      "Bash(gh issue comment *)"
+    ]
+  },
+  "autoMode": {
+    "allow": [
+      "$defaults",
+      "Closing, reopening, labeling, or commenting on issues and pull requests in repositories owned by the GitHub user Null-Phnix (the session owner's own repositories) is routine maintenance the user has asked for and may proceed."
+    ]
+  }
+}
